@@ -1,10 +1,8 @@
 import org.arl.fjage.*
 
 /*
- * Real-time 8-node UnetStack testbed for EnergyAwareRoutingAgent.
- *
- * Before running this file, install the project-local agent source as:
- *   <UNET_HOME>/classes/EnergyAwareRoutingAgent.groovy
+ * Optional real-time 8-node UnetStack topology matching routing_agent.groovy.
+ * Runs the real-time EAFTR policy agent on every node.
  */
 
 println '''
@@ -22,14 +20,16 @@ N7 (address 8): tcp://localhost:1108, http://localhost:8088/
 
 platform = RealTimePlatform
 
-// This is a complete forwarding stack. The policy agent is loaded after the
-// standard Router and RouteDiscoveryProtocol services it depends on.
+// Complete forwarding stack for the matching physical topology.
 def routingStack = {
   container.add 'arp',       new org.arl.unet.addr.AddressResolution()
   container.add 'ranging',   new org.arl.unet.localization.Ranging()
   container.add 'mac',       new org.arl.unet.mac.CSMA()
   container.add 'uwlink',    new org.arl.unet.link.ECLink()
-  container.add 'router',    new org.arl.unet.net.Router()
+  // Do not let Router assume every destination is a one-hop neighbour.
+  def router = new org.arl.unet.net.Router()
+  router.auto1hop = false
+  container.add 'router',    router
   container.add 'rdp',       new org.arl.unet.net.RouteDiscoveryProtocol()
   container.add 'transport', new org.arl.unet.transport.CaddyLite()
   container.add 'scheduler', new org.arl.unet.scheduler.Scheduler()

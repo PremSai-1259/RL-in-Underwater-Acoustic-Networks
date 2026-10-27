@@ -1,151 +1,220 @@
-import org.arl.fjage.*
-import org.arl.unet.*
-
+#!/usr/bin/env groovy
 /*
- * Reinforcement-learning-based energy-aware, fault-tolerant routing.
- *
- * State  : node currently holding the packet
- * Action : a reachable neighbour
- * Reward : residual energy - acoustic hop cost, with a large delivery reward
- *
- * A failed link/node is removed from the action set. Therefore the same
- * learner can be retrained after a fault without ever selecting that path.
+ * EAFTR: Energy-Aware Fault-Tolerant Routing for Underwater Acoustic Networks.
+ * Self-contained implementation of Progress-215_233_245.pdf.
+ * Run: groovy routing_agent.groovy [packets]
  */
+import java.util.Random
 
-final int NODE_COUNT = 8
-final int SOURCE = 0
-final int DESTINATION = 7
-final int EPISODES = 10_000
-final int MAX_HOPS = NODE_COUNT - 1       // prevents routing loops in an episode
-
-// Q-learning parameters from the proposal's RL design.
-final double ALPHA = 0.15                 // learning rate
-final double GAMMA = 0.90                 // future-reward discount
-final double EPSILON_START = 0.30          // exploration probability
-final double EPSILON_END = 0.03
-final double MINIMUM_ENERGY = 5.0          // a depleted relay is unavailable
-
-// Undirected connectivity graph for N0 ... N7.
-final List<List<Integer>> NEIGHBORS = [
-    [1, 2],
-    [0, 3, 4],
-    [0, 4, 5],
-    [1, 6],
-    [1, 2, 6],
-    [2, 6],
-    [3, 4, 5, 7],
-    [6]
-]
-
-// Coordinates are used to approximate the cost of an acoustic hop (metres).
-final List<List<Double>> POSITION = [
-    [0.0,   0.0,   -10.0],
-    [100.0, 0.0,   -15.0],
-    [0.0,   100.0, -20.0],
-    [200.0, 0.0,   -20.0],
-    [100.0, 100.0, -25.0],
-    [0.0,   200.0, -15.0],
-    [250.0, 100.0, -20.0],
-    [350.0, 100.0, -10.0]
-]
-
-// Percentage of battery remaining at each node. Change values to test balancing.
-final List<Double> ENERGY = [100.0, 55.0, 90.0, 70.0, 60.0, 85.0, 65.0, 100.0]
-
-def linkKey = { int a, int b -> "${Math.min(a, b)}-${Math.max(a, b)}" }
-
-def distance = { int a, int b ->
-    Math.sqrt((0..<3).collect { axis ->
-        double difference = POSITION[a][axis] - POSITION[b][axis]
-        difference * difference
-    }.sum() as double)
+class Network {
+  final int size = 8, source = 0, destination = 7
+  final List<List<Integer>> neighbours = [
+    [1,2], [0,3,4], [0,4,5], [1,6], [1,2,6], [2,6], [3,4,5,7], [6]]
+  final List<List<Double>> position = [
+    [0d,0d,-10d], [100d,0d,-15d], [0d,100d,-20d], [200d,0d,-20d],
+    [100d,100d,-25d], [0d,200d,-15d], [250d,100d,-20d], [350d,100d,-10d]]
+  final List<Double> initialEnergy = [100d,40d,90d,70d,20d,35d,60d,100d]
+  String edge(int a, int b) { "${Math.min(a,b)}-${Math.max(a,b)}" }
+  double distance(int a, int b) {
+    Math.sqrt((0..<3).collect { int i -> double x=position[a][i]-position[b][i]; x*x }.sum() as double)
+  }
+  double quality(int a, int b) { Math.exp(-distance(a,b)/500d) }
 }
 
-def newQTable = {
-    (0..<NODE_COUNT).collect { (0..<NODE_COUNT).collect { 0.0d } }
+class Parameters {
+  final double capacity=100d, dataRate=10000d, txPower=10d, rxPower=2d
+  final int bytes=128, episodes=4000
+  final double routingCost=0.05d, margin=0.10d, soundSpeed=1500d
+  final double alpha=0.15d, gamma=0.90d, epsilonStart=0.30d, epsilonEnd=0.03d
+  double getDuration() { bytes*8d/dataRate }
+  double getTx() { txPower*duration }
+  double getRx() { rxPower*duration }
+  double getRelayThreshold() { rx+routingCost+tx+margin }
 }
 
-def routeForScenario = { String title, Set<String> failedLinks, Set<Integer> failedNodes ->
-    def q = newQTable()
-    def random = new Random(42L)           // reproducible demonstrations/results
+class Scenario {
+  String name; Set<String> links; Set<Integer> nodes; List<Double> energy
+  Scenario(String n, Set<String> l, Set<Integer> f, List<Double> e) {
+    name=n; links=new LinkedHashSet(l); nodes=new LinkedHashSet(f); energy=e.collect { it as double }
+  }
+}
 
-    def isAvailable = { int from, int to ->
-        !failedNodes.contains(from) &&
-        !failedNodes.contains(to) &&
-        ENERGY[to] >= MINIMUM_ENERGY &&
-        !failedLinks.contains(linkKey(from, to))
-    }
+class Metrics {
+  int offered, delivered, failedHops, decisions, dataHops
+  int lifetimePackets = -1
+  // elapsed includes failed attempts for throughput; deliveryDelay contains
+  // only packets that actually reached the destination.
+  double elapsed, deliveryDelay, energy
+  List<Integer> hops=[]
+  double pdr() { offered ? 100d*delivered/offered : 0d }
+  double loss() { offered ? 100d*(offered-delivered)/offered : 0d }
+  double meanDelay() { delivered ? deliveryDelay/delivered : 0d }
+  double throughput(int bytes) { elapsed ? delivered*bytes*8d/elapsed : 0d }
+  double meanHops() { hops ? hops.sum()/hops.size() : 0d }
+}
 
-    def actions = { int node, Set<Integer> visited ->
-        NEIGHBORS[node].findAll { next -> isAvailable(node, next) && !visited.contains(next) }
-    }
-
-    // Higher residual energy is preferred; longer underwater hops cost more.
-    def reward = { int from, int to ->
-        if (to == DESTINATION) return 100.0d
-        double energyBenefit = ENERGY[to] / 10.0d
-        double acousticCost = distance(from, to) / 100.0d
-        energyBenefit - acousticCost - 1.0d
-    }
-
-    EPISODES.times { episode ->
-        int current = SOURCE
-        def visited = [SOURCE] as Set<Integer>
-        double epsilon = EPSILON_START -
-            (EPSILON_START - EPSILON_END) * episode / (EPISODES - 1.0d)
-
-        for (int hop = 0; hop < MAX_HOPS && current != DESTINATION; hop++) {
-            List<Integer> choices = actions(current, visited)
-            if (choices.isEmpty()) break
-
-            int next = random.nextDouble() < epsilon
-                ? choices[random.nextInt(choices.size())]
-                : choices.max { candidate -> q[current][candidate] }
-
-            double immediateReward = reward(current, next)
-            visited.add(next)
-            List<Integer> futureActions = next == DESTINATION ? [] : actions(next, visited)
-            double bestFuture = futureActions.isEmpty()
-                ? 0.0d
-                : futureActions.collect { candidate -> q[next][candidate] }.max() as double
-
-            q[current][next] += ALPHA *
-                (immediateReward + GAMMA * bestFuture - q[current][next])
-            current = next
+class Policy {
+  String name
+  Network net; Parameters p
+  List<List<Double>> q
+  Policy(String n, Network network, Parameters parameters) { name=n; net=network; p=parameters }
+  List<List<Double>> table() { (0..<net.size).collect { (0..<net.size).collect { 0d } } }
+  boolean receiveOK(int node, List<Double> e, Set<Integer> failed) {
+    if (node < 0 || node >= net.size || failed.contains(node)) return false
+    e[node] >= (node == net.destination ? p.rx+p.margin : p.relayThreshold)
+  }
+  boolean transmitOK(int node, List<Double> e, Set<Integer> failed) {
+    !failed.contains(node) && e[node] >= p.routingCost+p.tx
+  }
+  boolean pathExists(int start, Set<Integer> visited, List<Double> e, Set<String> failedLinks,
+                     Set<String> blocked, Set<Integer> failedNodes) {
+    if (failedNodes.contains(start)) return false
+    def queue=new ArrayDeque<Integer>(); def seen=new LinkedHashSet<Integer>()
+    queue.add(start); seen.add(start)
+    while (!queue.isEmpty()) {
+      int current=queue.removeFirst()
+      if (current == net.destination) return true
+      if (!transmitOK(current,e,failedNodes)) continue
+      net.neighbours[current].each { int next ->
+        String edge=net.edge(current,next)
+        if (!seen.contains(next) && !visited.contains(next) && !failedNodes.contains(next) &&
+            !failedLinks.contains(edge) && !blocked.contains(edge) && receiveOK(next,e,failedNodes)) {
+          seen.add(next); queue.add(next)
         }
+      }
     }
-
-    int current = SOURCE
-    def route = [SOURCE]
-    def visited = [SOURCE] as Set<Integer>
-    def hopRewards = []
-
-    for (int hop = 0; hop < MAX_HOPS && current != DESTINATION; hop++) {
-        List<Integer> choices = actions(current, visited)
-        if (choices.isEmpty()) break
-        int next = choices.max { candidate -> q[current][candidate] }
-        hopRewards << String.format("N%d -> N%d  (Q=%.2f, reward=%.2f)",
-            current, next, q[current][next], reward(current, next))
-        route << next
-        visited.add(next)
-        current = next
+    false
+  }
+  List<Integer> actions(int current, Set<Integer> visited, List<Double> e, Set<String> failedLinks,
+                        Set<String> blocked, Set<Integer> failedNodes) {
+    if (!transmitOK(current,e,failedNodes)) return []
+    net.neighbours[current].findAll { int next ->
+      String edge=net.edge(current,next)
+      !visited.contains(next) && !failedNodes.contains(next) && !failedLinks.contains(edge) &&
+        !blocked.contains(edge) && receiveOK(next,e,failedNodes) &&
+        pathExists(next,visited,e,failedLinks,blocked,failedNodes)
     }
-
-    println "\n${'=' * 62}"
-    println title
-    println "${'=' * 62}"
-    println "Failed links: " + (failedLinks ? failedLinks.join(', ') : 'none')
-    println "Failed nodes: " + (failedNodes ? failedNodes.collect { "N${it}" }.join(', ') : 'none')
-    println "Energy (%): " + ENERGY.withIndex().collect { value, index -> "N${index}=${value.intValue()}" }.join(', ')
-    println "Selected route: " + route.collect { "N${it}" }.join(' -> ')
-    println current == DESTINATION ? 'Destination reached.' : 'No fault-tolerant route found.'
-    hopRewards.each { println "  ${it}" }
-    println "\nQ-table (only valid links acquire values):"
-    (0..<NODE_COUNT).each { state ->
-        println "N${state}: " + q[state].collect { String.format('%7.2f', it) }.join(' ')
+  }
+  double reward(int from, int to, List<Double> e) {
+    if (to == net.destination) return 100d
+    double battery=10d*e[to]/p.capacity
+    double reliability=5d*net.quality(from,to)
+    double progress=(net.distance(from,net.destination)-net.distance(to,net.destination))/100d
+    battery+reliability+progress-2d*(p.tx+p.rx+p.routingCost)-1d
+  }
+  int best(int current, List<Integer> options) {
+    double high=options.collect { q[current][it] }.max() as double
+    options.find { Math.abs(q[current][it]-high) < 1e-10 }
+  }
+  void train(List<Double> e, Set<String> failedLinks, Set<Integer> failedNodes) {
+    q=table(); Random random=new Random(42L)
+    p.episodes.times { int episode ->
+      int current=net.source; def visited=[current] as Set<Integer>
+      double epsilon=p.epsilonStart-(p.epsilonStart-p.epsilonEnd)*episode/Math.max(1d,p.episodes-1d)
+      for (int hop=0; hop<net.size-1 && current!=net.destination; hop++) {
+        List<Integer> options=actions(current,visited,e,failedLinks,[] as Set<String>,failedNodes)
+        if (!options) break
+        int next=random.nextDouble()<epsilon ? options[random.nextInt(options.size())] : best(current,options)
+        def after=new LinkedHashSet<Integer>(visited); after.add(next)
+        List<Integer> future=next==net.destination ? [] : actions(next,after,e,failedLinks,[] as Set<String>,failedNodes)
+        double futureValue=future ? future.collect { q[next][it] }.max() as double : 0d
+        q[current][next] += p.alpha*(reward(current,next,e)+p.gamma*futureValue-q[current][next])
+        current=next; visited.add(next)
+      }
     }
+  }
+  int choose(int current, List<Integer> options, List<Double> e) { best(current,options) }
 }
 
-// Baseline, then re-learning with the N5--N6 acoustic link unavailable.
-routeForScenario('SCENARIO 1: NORMAL NETWORK', [] as Set<String>, [] as Set<Integer>)
-routeForScenario('SCENARIO 2: N5 <-> N6 LINK FAILURE', [linkKey(5, 6)] as Set<String>, [] as Set<Integer>)
+class EnergyGreedy extends Policy {
+  EnergyGreedy(Network n, Parameters p) { super('Energy-greedy baseline',n,p) }
+  void train(List<Double> e, Set<String> l, Set<Integer> n) {}
+  int choose(int current, List<Integer> options, List<Double> e) {
+    options.max { int a, int b ->
+      int value=Double.compare(e[a],e[b])
+      value ? value : Double.compare(net.quality(current,a),net.quality(current,b))
+    }
+  }
+}
+class Geographic extends Policy {
+  Geographic(Network n, Parameters p) { super('Geographic baseline',n,p) }
+  void train(List<Double> e, Set<String> l, Set<Integer> n) {}
+  int choose(int current, List<Integer> options, List<Double> e) {
+    options.min { int a, int b -> Double.compare(net.distance(a,net.destination),net.distance(b,net.destination)) }
+  }
+}
+
+class Simulation {
+  final Network net=new Network(); final Parameters p=new Parameters()
+  Metrics execute(Policy policy, Scenario scenario, int count, long seed) {
+    List<Double> e=scenario.energy.collect { it as double }
+    policy.train(e,scenario.links,scenario.nodes)
+    Metrics m=new Metrics(); Random channel=new Random(seed)
+    count.times {
+      m.offered++; int current=net.source; int hops=0; double packetDelay=0d
+      def visited=[current] as Set<Integer>; def blocked=[] as Set<String>
+      if (m.lifetimePackets < 0 && !policy.pathExists(net.source, visited, e,
+          scenario.links, blocked, scenario.nodes)) {
+        m.lifetimePackets=m.offered-1
+      }
+      while (current!=net.destination && hops<net.size-1) {
+        List<Integer> choices=policy.actions(current,visited,e,scenario.links,blocked,scenario.nodes)
+        if (!choices) break
+        int next=policy.choose(current,choices,e); String edge=net.edge(current,next); m.decisions++
+        if (!policy.transmitOK(current,e,scenario.nodes)) break
+        e[current]-=p.routingCost+p.tx; m.energy+=p.routingCost+p.tx
+        double hopDelay=p.duration+net.distance(current,next)/p.soundSpeed
+        // The medium access and propagation time is spent whether the packet
+        // is received, corrupted on the channel, or reaches an exhausted node.
+        packetDelay+=hopDelay
+        if (channel.nextDouble()>net.quality(current,next)) {
+          blocked.add(edge); m.failedHops++; continue
+        }
+        if (e[next]<p.rx) break
+        e[next]-=p.rx; m.energy+=p.rx
+        current=next; visited.add(next); hops++; m.dataHops++
+      }
+      m.elapsed+=packetDelay
+      if (current==net.destination) {
+        m.delivered++; m.hops << hops; m.deliveryDelay+=packetDelay
+      }
+    }
+    if (m.lifetimePackets < 0) m.lifetimePackets=count
+    m
+  }
+  void printMetrics(String scenario, Policy policy, Metrics m) {
+    println String.format('%-20s %-24s PDR=%6.2f%% loss=%6.2f%% delay=%7.4fs throughput=%8.1f bps energy=%7.3f J hops=%4.2f life=%3d pkts overhead=%4.2f',
+      scenario,policy.name,m.pdr(),m.loss(),m.meanDelay(),m.throughput(p.bytes),m.energy,m.meanHops(),m.lifetimePackets,m.offered ? m.decisions/(double)m.offered : 0d)
+  }
+  void run(int count) {
+    if (count<1) throw new IllegalArgumentException('Packet count must be at least 1.')
+    println 'EAFTR — Reinforcement Learning Energy-Aware Fault-Tolerant Routing'
+    println String.format('Packets/experiment: %d | training episodes: %d | packet duration: %.4f s | TX: %.4f J | RX: %.4f J',
+      count,p.episodes,p.duration,p.tx,p.rx)
+    List<Scenario> scenarios=[
+      new Scenario('Normal',[] as Set<String>,[] as Set<Integer>,net.initialEnergy),
+      new Scenario('Link N3-N6 failed',[net.edge(3,6)] as Set<String>,[] as Set<Integer>,net.initialEnergy),
+      new Scenario('Node N3 failed',[] as Set<String>,[3] as Set<Integer>,net.initialEnergy),
+      // Deliberately energy constrained, but still connected. The old setup
+      // made N6 ineligible as a relay and therefore had no source-destination
+      // path before the first packet was offered.
+      new Scenario('Low battery',[] as Set<String>,[] as Set<Integer>,[5d,4d,4d,2d,1.5d,3d,4d,5d])]
+    File csv=new File('results.csv')
+    csv.text='scenario,algorithm,offered,delivered,pdr_percent,loss_percent,average_delay_s,throughput_bps,energy_j,average_hops,lifetime_packets,routing_decisions,failed_hops\n'
+    scenarios.eachWithIndex { Scenario s, int si ->
+      println "\n--- ${s.name}; failed links: ${s.links ?: 'none'}; failed nodes: ${s.nodes ?: 'none'} ---"
+      List<Policy> policies=[new Policy('EAFTR Q-learning',net,p),new EnergyGreedy(net,p),new Geographic(net,p)]
+      policies.each { Policy policy ->
+        // Common random numbers make every policy face the same reproducible channel stream.
+        Metrics m=execute(policy,s,count,10000L+si*100L); printMetrics(s.name,policy,m)
+        csv << [s.name,policy.name,m.offered,m.delivered,m.pdr(),m.loss(),m.meanDelay(),m.throughput(p.bytes),m.energy,m.meanHops(),m.lifetimePackets,m.decisions,m.failedHops].collect {
+          it instanceof String ? '"'+it.replace('"','""')+'"' : it
+        }.join(',')+'\n'
+      }
+    }
+    println "\nSaved machine-readable results to ${csv.canonicalPath}"
+  }
+}
+
+int packets=args ? Integer.parseInt(args[0]) : 100
+new Simulation().run(packets)
