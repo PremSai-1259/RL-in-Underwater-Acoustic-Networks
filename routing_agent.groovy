@@ -23,7 +23,7 @@ class Network {
 
 class Parameters {
   final double capacity=100d, dataRate=10000d, txPower=10d, rxPower=2d
-  final int bytes=128, episodes=4000
+  final int bytes=128, episodes=800
   final double routingCost=0.05d, margin=0.10d, soundSpeed=1500d
   final double alpha=0.15d, gamma=0.90d, epsilonStart=0.30d, epsilonEnd=0.03d
   double getDuration() { bytes*8d/dataRate }

@@ -9,16 +9,26 @@ import java.util.Random
 /**
  * Live UnetStack implementation of EAFTR. One instance runs at every node,
  * learns a local Q-learning policy and adds the selected next hop to Router.
+ * Direct neighbours exchange lightweight request/reply energy datagrams; no
+ * agent reads another agent's fields or Q-table.
  */
 class EnergyAwareRoutingAgent extends UnetAgent {
-  enum Params implements Parameter { source, destination, energy, failedLinks, failedNodes, episodes, qtable }
+  enum Params implements Parameter { destination, energy, failedLinks, failedNodes, episodes, neighborInfo, qtable }
   static final String title = 'EAFTR Q-learning routing'
   static final String description = 'Energy-aware, fault-tolerant routing policy'
   double alpha=0.15d, gamma=0.90d, epsilonStart=0.30d, epsilonEnd=0.03d
-  // 800 episodes keeps a full 8 x 8 route-table refresh responsive in
-  // real-time while still providing epsilon-greedy Q-learning convergence.
-  int episodes=800, source=1, destination=8
-  List<Double> energy=[100d,40d,90d,70d,20d,35d,60d,100d]
+  // Keep the live policy's feasibility and reward model identical to the
+  // offline experiment: 128 bytes at 10 kbps, 10 W TX and 2 W RX.
+  static final double packetBytes=128d, dataRate=10000d, txPower=10d, rxPower=2d
+  static final double routingCost=0.05d, energyReserve=0.10d
+  static final int energyProtocol=Protocol.USER+1
+  // 800 episodes keeps local policy initialization responsive while still
+  // providing epsilon-greedy model-bootstrap convergence.
+  int episodes=800, destination=8
+  // Each physical node owns only this agent's energy model. It is not a
+  // hardware measurement and is never a network-wide vector.
+  private double initialEnergy=100d
+  private double residualEnergy=100d
   Set<String> failedLinks=[] as Set<String>
   Set<Integer> failedNodes=[] as Set<Integer>
 
@@ -31,50 +41,89 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     7:[250d,100d,-20d], 8:[350d,100d,-10d]]
   private AgentID router, link
   private int address=-1
-  private Map q=[:]
-  // One learned action-value map per destination, exposed by rlroute.qtable.
-  private Map<Integer,Map> qTables=[:]
+  // Q[destination][nextHop]; the current node is implicit in this instance.
+  private Map<Integer,Map<Integer,Double>> qTables=[:]
+  // Actions are bootstrapped once when they first become feasible. This is
+  // separate from table creation because neighbour replies arrive later.
+  private Map<Integer,Set<Integer>> bootstrappedActions=[:]
+  // Snapshots received in EAFTR request/reply datagrams. They are local,
+  // expire after 90 s, and are never read from another agent.
+  private Map<Integer,Map> neighborCache=[:]
+  static final long neighborInfoMaxAgeMs=90000L
+  // The wall-clock guard prevents control traffic from draining the model when
+  // a simulator schedules wakeups faster than expected.
+  static final long neighborQueryIntervalMs=60000L
+  private long localAdvertisementSequence=0L
+  private Map<Integer,Long> lastEnergyRequestAt=[:]
+  private Map<Integer,Double> pendingControlTxCost=[:]
   private Map<Integer,Integer> installedNextHops=[:]
   private boolean refreshQueued=false
 
   @Override List<Parameter> getParameterList() { allOf(Params) }
-  @Override boolean isReadOnly(Parameter parameter) {
-    parameter == Params.qtable || super.isReadOnly(parameter)
+  // Unet 7.0.0 does not declare this hook on UnetAgent, so this intentionally
+  // has no @Override annotation. Newer shells still discover it as a property
+  // metadata method.
+  boolean isReadOnly(Parameter parameter) {
+    parameter == Params.qtable || parameter == Params.neighborInfo
+  }
+  double getEnergy() { residualEnergy }
+  String getNeighborInfo() {
+    neighborCache.collect { int id, Map n -> "${id}:${n.energy}:${n.sequence}:${n.time}" }.join(',')
   }
   String getQtable() {
-    if (address < 1 || qTables.isEmpty()) return 'Q-tables are still training. Wait a few seconds and try again.'
-    StringBuilder out=new StringBuilder("EAFTR Q-tables at node ${address}\n")
+    if (address < 1 || qTables.isEmpty()) return 'No local Q-values yet; wait for startup and fresh neighbour information.'
+    StringBuilder out=new StringBuilder("EAFTR local Q-table at node ${address} (Q[destination][nextHop])\n")
     qTables.keySet().sort().each { int target ->
       out.append("\nDestination ${target}\n")
-      neighbors.keySet().sort().each { int from ->
-        List<String> values=neighbors[from].collect { int to ->
-          "${to}:${String.format('%.2f', qTables[target][from][to])}"
-        }
-        out.append("  ${from} -> ").append(values.join(', ')).append('\n')
-      }
+      out.append('  ').append(qTables[target].keySet().sort().collect { int hop ->
+        "${hop}:${String.format('%.2f', qTables[target][hop])}"
+      }.join(', ')).append('\n')
     }
     out.toString()
   }
   @Override void startup() {
     router=agentForService(Services.ROUTING); link=agentForService(Services.LINK)
     if (link != null) subscribe topic(link)
+    // UnetStack 7 publishes received datagrams on this global topic.
+    subscribe topic(Topics.DATAGRAM)
     add new WakerBehavior(1000, {
       def info=agentForService(Services.NODE_INFO)
       address=get(info,NodeInfoParam.address) as int
       refreshPolicy()
+      requestNeighborEnergy()
+      scheduleNeighborEnergyRequests()
     })
   }
   @Override void processMessage(Message msg) {
-    if (!(msg instanceof LinkStatusNtf) || msg.sender != link || address<1) return
+    if (address<1) return
+    if (msg instanceof DatagramNtf) {
+      // A DatagramNtf confirms successful local delivery, so RX is charged
+      // exactly once here, including for EAFTR control datagrams.
+      double receiveCost=msg.protocol==energyProtocol ? rxEnergy(msg.data?.length ?: 0d) : rxEnergy()
+      debitLocalEnergy(receiveCost, 'verified datagram reception')
+      if (msg.protocol == energyProtocol) handleEnergyDatagram(msg)
+      return
+    }
+    if (msg.sender != link) return
+    // One local ECLink notification represents one actual acoustic send
+    // attempt. Retries are separate attempts and are charged separately.
+    if (msg instanceof DatagramTransmissionNtf) {
+      Double controlCost=pendingControlTxCost.remove(msg.to)
+      debitLocalEnergy(controlCost ?: routingCost+txEnergy(),
+        controlCost == null ? 'data transmission decision and TX' : 'energy-control TX')
+      return
+    }
+    if (!(msg instanceof LinkStatusNtf)) return
     if (!neighbors[address]?.contains(msg.to)) return
     String edge=key(address,msg.to)
     if (msg.up) failedLinks.remove(edge); else failedLinks.add(edge)
     queueRefresh()
   }
-  void setEnergy(List values) {
-    if (values==null || values.size()!=8 || values.any { it==null || (it as double)<0d })
-      throw new IllegalArgumentException('energy must contain 8 non-negative joule values')
-    this.@energy=values.collect { it as double }; queueRefresh()
+  /** Configure this node only; a list is rejected to prevent shared energy. */
+  void setEnergy(Object value) {
+    if (!(value instanceof Number) || (value as double)<0d)
+      throw new IllegalArgumentException('energy must be one non-negative joule value for this node')
+    initialEnergy=value as double; residualEnergy=initialEnergy; queueRefresh()
   }
   void setFailedLinks(Collection values) {
     this.@failedLinks=(values ?: []).collect { it.toString() } as Set<String>; queueRefresh()
@@ -95,102 +144,163 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     refreshQueued=true
     add new WakerBehavior(250, { refreshQueued=false; refreshPolicy() })
   }
+  /** Optional hook for a verified reception path outside DatagramNtf. */
+  void accountReception() { debitLocalEnergy(rxEnergy(), 'verified reception') }
+  /** Stores a validated EAFTR reply locally; it never accesses a remote field. */
+  void recordNeighborAdvertisement(int node, double joules, long sequence, long timestamp=System.currentTimeMillis()) {
+    if (address<1 || !neighbors[address]?.contains(node) || joules<0d || timestamp<=0L) return
+    Map previous=neighborCache[node]
+    if (previous != null && sequence <= (previous.sequence as long)) return
+    neighborCache[node]=[energy:joules, sequence:sequence, time:timestamp]
+    log.info(String.format('EAFTR: node %d cached %.3f J from neighbour %d',address,joules,node))
+    queueRefresh()
+  }
+  private void debitLocalEnergy(double amount, String event) {
+    if (amount<=0d) return
+    residualEnergy=Math.max(0d,residualEnergy-amount)
+    log.info(String.format('EAFTR: node %d energy %.3f J after %s',address,residualEnergy,event))
+    queueRefresh()
+  }
+  private void scheduleNeighborEnergyRequests() {
+    add new WakerBehavior(neighborQueryIntervalMs, {
+      if (address>0 && !failedNodes.contains(address)) requestNeighborEnergy()
+      scheduleNeighborEnergyRequests()
+    })
+  }
+  /** Requests each direct neighbour's own estimate over one-hop ECLink. */
+  private void requestNeighborEnergy() {
+    if (link==null || !canTransmitLocal()) return
+    long requestId=++localAdvertisementSequence
+    long now=System.currentTimeMillis()
+    neighbors[address]?.each { int node ->
+      Long previous=lastEnergyRequestAt[node]
+      if (!failedNodes.contains(node) && !failedLinks.contains(key(address,node)) &&
+          (previous==null || now-previous>=neighborQueryIntervalMs)) {
+        lastEnergyRequestAt[node]=now
+        log.info("EAFTR: node ${address} requesting energy from neighbour ${node}")
+        sendEnergyControl(node,"EAFTR:ENERGY_REQ:${requestId}")
+      }
+    }
+  }
+  private void handleEnergyDatagram(DatagramNtf msg) {
+    String payload
+    try { payload=new String(msg.data as byte[], 'UTF-8') }
+    catch (Exception ignored) { return }
+    String[] part=payload.split(':')
+    if (part.size()==3 && part[0]=='EAFTR' && part[1]=='ENERGY_REQ') {
+      // The normal local TX notification charges this reply's decision + TX.
+      if (neighbors[address]?.contains(msg.from) && canTransmitLocal()) {
+        long sequence=++localAdvertisementSequence
+        log.info("EAFTR: node ${address} replying to energy request from ${msg.from}")
+        sendEnergyControl(msg.from,"EAFTR:ENERGY_RSP:${sequence}:${residualEnergy}:${System.currentTimeMillis()}")
+      }
+      return
+    }
+    if (part.size()==5 && part[0]=='EAFTR' && part[1]=='ENERGY_RSP') {
+      try {
+        // Reply layout is EAFTR:ENERGY_RSP:sequence:joules:timestamp.
+        recordNeighborAdvertisement(msg.from as int,part[3] as double,part[2] as long,part[4] as long)
+      } catch (Exception ignored) { log.warning('EAFTR: ignored malformed neighbour-energy response') }
+    }
+  }
+  private void sendEnergyControl(int target, String payload) {
+    byte[] data=payload.getBytes('UTF-8')
+    pendingControlTxCost[target]=txEnergy(data.length as double)
+    send new DatagramReq(recipient:link, to:target, protocol:energyProtocol,
+      reliability:false, data:data)
+  }
 
   /**
    * Installs a route to every other address in the known topology. This makes
    * the agent a real Router policy, not a N0-to-N7-only demonstration.
    */
   void refreshPolicy() {
-    if (router==null || address<1 || failedNodes.contains(address)) return
+    if (router==null || address<1) return
+    // Remove routes that now point at a declared failed destination. If this
+    // node itself is failed, it must not retain any EAFTR forwarding policy.
+    installedNextHops.keySet().findAll { failedNodes.contains(it) || failedNodes.contains(address) }
+      .toList().each { int target -> removeInstalledRoute(target) }
+    if (failedNodes.contains(address)) return
     neighbors.keySet().findAll { it!=address && !failedNodes.contains(it) }
       .sort().each { int target -> installRoute(target) }
   }
   private void installRoute(int target) {
-    q=train(target)
-    qTables[target]=q
-    Integer next=bestLocalAction(target)
-    if (next==null) { log.warning("EAFTR: no feasible path from ${address} to ${target}"); return }
-    // Delete previous policy route for this destination but retain RDP fallback routes.
-    Integer oldNext=installedNextHops[target]
-    if (oldNext != null) {
-      def remove=EditRouteReq.deleteRoute()
-      remove.to=target; remove.nextHop=oldNext; remove.link=link
-      remove.recipient=router; send(remove)
+    Map<Integer,Double> values=localTable(target)
+    // A refresh retains values; only newly initialized local actions are
+    // model-bootstrapped below.
+    trainUnseenActions(target,values)
+    Integer next=bestLocalAction(target,values)
+    if (next==null) {
+      // A route learned before a failure/energy change must not survive as a
+      // stale Router entry. RDP routes are untouched.
+      removeInstalledRoute(target)
+      log.warning("EAFTR: no feasible path from ${address} to ${target}")
+      return
     }
+    // Delete previous policy route for this destination but retain RDP fallback routes.
+    removeInstalledRoute(target)
     def request=EditRouteReq.newRoute()
     request.to=target; request.nextHop=next; request.link=link; request.hops=1
-    request.reliability=true; request.metric=(1000d+q[address][next]) as float
+    request.reliability=true; request.metric=(1000d+values[next]) as float
     request.auto=false; request.recipient=router; send(request)
     installedNextHops[target]=next
     log.info("EAFTR: route ${address} -> ${target} via ${next}")
   }
+  private void removeInstalledRoute(int target) {
+    Integer oldNext=installedNextHops.remove(target)
+    if (oldNext == null) return
+    def remove=EditRouteReq.deleteRoute()
+    remove.to=target; remove.nextHop=oldNext; remove.link=link
+    remove.recipient=router; send(remove)
+  }
 
-  private Map train(int target) {
-    def values=[:]
-    neighbors.each { int node, List<Integer> list ->
-      values[node]=[:]; list.each { int next -> values[node][next]=0d }
-    }
-    // Every node uses the same training sequence for a target, so the network
-    // forms one consistent destination-rooted policy rather than independent
-    // local policies that could point back to one another.
-    Random random=new Random(10000L+target)
-    List<Integer> starts=neighbors.keySet().findAll { !failedNodes.contains(it) }.sort()
-    episodes.times { int episode ->
-      int current=starts[episode % starts.size()]
-      def visited=[current] as Set<Integer>
-      double epsilon=epsilonStart-(epsilonStart-epsilonEnd)*episode/Math.max(1d,episodes-1d)
-      for (int hop=0; hop<7 && current!=target; hop++) {
-        List<Integer> options=actions(current,visited,target)
-        if (!options) break
-        int next=random.nextDouble()<epsilon ? options[random.nextInt(options.size())] : maxQ(current,options,values)
-        def after=new LinkedHashSet<Integer>(visited); after.add(next)
-        List<Integer> future=next==target ? [] : actions(next,after,target)
-        double bestFuture=future ? future.collect { values[next][it] }.max() as double : 0d
-        values[current][next]+=alpha*(reward(current,next,target)+gamma*bestFuture-values[current][next])
-        current=next; visited.add(next)
+  private Map<Integer,Double> localTable(int target) {
+    if (!qTables.containsKey(target)) qTables[target]=neighbors[address].collectEntries { int hop -> [(hop):0d] }
+    qTables[target]
+  }
+  /**
+   * The available live stack has no portable delivery/ACK feedback. Bootstrap
+   * is therefore a terminal one-hop model transition (future max = 0), never
+   * a fabricated read of the next node's Q-table. Values persist afterwards.
+   */
+  private void trainUnseenActions(int target, Map<Integer,Double> values) {
+    List<Integer> choices=actions(target,[] as Set<Integer>)
+    if (!choices) return
+    Set<Integer> trained=bootstrappedActions[target]
+    if (trained==null) { trained=[] as Set<Integer>; bootstrappedActions[target]=trained }
+    choices.findAll { !trained.contains(it) }.each { int next ->
+      // Model bootstrap for this newly feasible action only. The value remains
+      // unchanged on ordinary refreshes and later comes from real feedback.
+      episodes.times {
+        values[next]+=alpha*(reward(address,next,target)-values[next])
       }
-    }
-    values
-  }
-  private Integer bestLocalAction(int target) {
-    List<Integer> options=actions(address,[] as Set<Integer>,target)
-    options ? maxQ(address,options,q) : null
-  }
-  private int maxQ(int from, List<Integer> options, Map values) {
-    double high=options.collect { values[from][it] }.max() as double
-    options.find { Math.abs(values[from][it]-high)<1e-9 }
-  }
-  // Filters failures, energy-ineligible relays, loops and routing voids.
-  private List<Integer> actions(int from, Set<Integer> visited, int target) {
-    if (failedNodes.contains(from) || !canTransmit(from)) return []
-    int currentHops=hopDistance(from,target)
-    if (currentHops == Integer.MAX_VALUE) return []
-    neighbors[from].findAll { int to ->
-      !visited.contains(to) && !failedNodes.contains(to) && !failedLinks.contains(key(from,to)) &&
-        canReceive(to,target) && pathExists(to,visited,target) &&
-        hopDistance(to,target) < currentHops
+      trained.add(next)
     }
   }
-  // Restrict forwarding to a neighbour with fewer feasible hops to the
-  // destination. This preserves Q-learning's choice among candidates while
-  // guaranteeing that the installed Router policy cannot form a loop.
-  private int hopDistance(int start, int target) {
-    if (start == target) return 0
-    def queue=new ArrayDeque<Integer>(); def distance=[:]
-    queue.add(start); distance[start]=0
-    while (!queue.isEmpty()) {
-      int current=queue.removeFirst()
-      if (current == target) return distance[current] as int
-      if (!canTransmit(current)) continue
-      neighbors[current].each { int next ->
-        if (distance[next] == null && !failedNodes.contains(next) &&
-            !failedLinks.contains(key(current,next)) && canReceive(next,target)) {
-          distance[next]=(distance[current] as int)+1
-          queue.add(next)
-        }
-      }
+  /** Hook for a deployment-specific ACK/delivery adapter with real feedback. */
+  void recordForwardingFeedback(int target, int nextHop, double observedReward, double futureMax=0d, boolean terminal=true) {
+    Map<Integer,Double> values=localTable(target)
+    if (!values.containsKey(nextHop)) return
+    double continuation=terminal ? 0d : Math.max(0d,futureMax)
+    values[nextHop]+=alpha*(observedReward+gamma*continuation-values[nextHop])
+    queueRefresh()
+  }
+  private Integer bestLocalAction(int target, Map<Integer,Double> values) {
+    List<Integer> options=actions(target,[] as Set<Integer>)
+    options ? maxQ(options,values) : null
+  }
+  private int maxQ(List<Integer> options, Map<Integer,Double> values) {
+    double high=options.collect { values[it] ?: 0d }.max() as double
+    options.find { Math.abs((values[it] ?: 0d)-high)<1e-9 }
+  }
+  // Only this node's energy and direct-neighbour advertisements are used.
+  // Remote battery state is intentionally unknown to this local agent.
+  private List<Integer> actions(int target, Set<Integer> visited) {
+    if (failedNodes.contains(address) || !canTransmitLocal()) return []
+    neighbors[address].findAll { int to ->
+      !visited.contains(to) && !failedNodes.contains(to) && !failedLinks.contains(key(address,to)) &&
+        neighborCanReceive(to,target) && pathExists(to,visited,target)
     }
-    Integer.MAX_VALUE
   }
   private boolean pathExists(int start, Set<Integer> visited, int target) {
     def queue=new ArrayDeque<Integer>(); def seen=new LinkedHashSet<Integer>()
@@ -198,26 +308,32 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     while (!queue.isEmpty()) {
       int current=queue.removeFirst()
       if (current==target) return true
-      if (!canTransmit(current)) continue
       neighbors[current].each { int next ->
         if (!seen.contains(next) && !visited.contains(next) && !failedNodes.contains(next) &&
-            !failedLinks.contains(key(current,next)) && canReceive(next,target)) { seen.add(next); queue.add(next) }
+            !failedLinks.contains(key(current,next))) { seen.add(next); queue.add(next) }
       }
     }
     false
   }
   private double reward(int from, int to, int target) {
     if (to==target) return 100d
-    double battery=10d*energyAt(to)/100d
+    double battery=10d*freshNeighborEnergy(to)/Math.max(1d,initialEnergy)
     double quality=5d*Math.exp(-distance(from,to)/500d)
     double progress=(distance(from,target)-distance(to,target))/100d
-    battery+quality+progress-2d*(0.1024d+0.02048d+0.05d)-1d
+    battery+quality+progress-2d*(txEnergy()+rxEnergy()+routingCost)-1d
   }
-  private boolean canTransmit(int node) { energyAt(node)>=0.05d+0.1024d+0.10d }
-  private boolean canReceive(int node, int target) {
-    energyAt(node)>=(node==target ? 0.02048d+0.10d : 0.02048d+0.05d+0.1024d+0.10d)
+  private boolean canTransmitLocal() { residualEnergy>=routingCost+txEnergy()+energyReserve }
+  private boolean neighborCanReceive(int node, int target) {
+    freshNeighborEnergy(node)>=(node==target ? rxEnergy()+energyReserve : rxEnergy()+routingCost+txEnergy()+energyReserve)
   }
-  private double energyAt(int node) { node>=1 && node<=energy.size() ? energy[node-1] : 0d }
+  private double freshNeighborEnergy(int node) {
+    Map snapshot=neighborCache[node]
+    if (snapshot==null || System.currentTimeMillis()-(snapshot.time as long)>neighborInfoMaxAgeMs) return -1d
+    snapshot.energy as double
+  }
+  private static double packetDuration(double bytes=packetBytes) { bytes*8d/dataRate }
+  private static double txEnergy(double bytes=packetBytes) { txPower*packetDuration(bytes) }
+  private static double rxEnergy(double bytes=packetBytes) { rxPower*packetDuration(bytes) }
   private double distance(int a, int b) {
     Math.sqrt((0..<3).collect { int i -> double d=position[a][i]-position[b][i]; d*d }.sum() as double)
   }
