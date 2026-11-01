@@ -102,7 +102,6 @@ class EnergyAwareRoutingAgent extends UnetAgent {
   static final long ADVERTISEMENT_INTERVAL_MS = 5000L
   static final long MIN_ADVERT_GAP_MS = 2000L
   static final double ENERGY_CHANGE_THRESHOLD_J = 1.0d
-  static final double Q_ENERGY_RECALCULATION_DELTA_J = 1.0d
 
   @Override
   List<Parameter> getParameterList() {
@@ -527,11 +526,13 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
     String state = networkStateKey()
     Map<Integer, Double> profile = currentQEnergyProfile()
-    if (!force && !energyProfileRequiresRefresh(state, profile)) return false
+    Set<Integer> affectedHops = force ? null :
+      changedEnergyHops(state, profile)
+    if (!force && affectedHops != null && affectedHops.isEmpty()) return false
 
     Map<Integer, Map<Integer, Double>> qTables = currentQTables()
     qTables.keySet().each { int target ->
-      recalculateDestinationQValues(target, qTables[target])
+      recalculateDestinationQValues(target, qTables[target], affectedHops)
     }
 
     lastQEnergyProfileByState[state] = profile
@@ -547,29 +548,33 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     profile
   }
 
-  private boolean energyProfileRequiresRefresh(
+  // null means a full refresh is required (new state, source-energy change,
+  // or missing profile entry). Otherwise only these direct next hops changed.
+  private Set<Integer> changedEnergyHops(
     String state,
     Map<Integer, Double> current
   ) {
     Map<Integer, Double> previous = lastQEnergyProfileByState[state]
-    if (previous == null) return true
+    if (previous == null) return null
 
     Set<Integer> nodes = [] as Set<Integer>
     nodes.addAll(previous.keySet())
     nodes.addAll(current.keySet())
 
-    nodes.any { int node ->
+    Set<Integer> changed = [] as Set<Integer>
+
+    for (int node : nodes) {
       Double before = previous[node]
       Double after = current[node]
-      if (before == null || after == null) return true
+      if (before == null || after == null || node == address) {
+        if (before != after) return null
+        continue
+      }
 
-      double required = node == address
-        ? routingCost + txEnergy() + energyReserve
-        : rxEnergy() + txEnergy() + routingCost + energyReserve
-
-      Math.abs(after - before) >= Q_ENERGY_RECALCULATION_DELTA_J ||
-        ((before >= required) != (after >= required))
+      if (before != after) changed.add(node)
     }
+
+    changed
   }
 
   private String networkStateKey() {
@@ -592,7 +597,8 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
   private void recalculateDestinationQValues(
     int target,
-    Map<Integer, Double> values
+    Map<Integer, Double> values,
+    Set<Integer> affectedHops = null
   ) {
     Map<Integer, Set<Integer>> bootstrappedActions = currentBootstrappedActions()
     Set<Integer> trained = bootstrappedActions[target]
@@ -602,7 +608,9 @@ class EnergyAwareRoutingAgent extends UnetAgent {
       bootstrappedActions[target] = trained
     }
 
-    (neighbors[address] ?: []).each { int hop ->
+    (neighbors[address] ?: []).findAll { int hop ->
+      affectedHops == null || affectedHops.contains(hop)
+    }.each { int hop ->
       if (!isActionFeasible(hop, target)) {
         values[hop] = -10d
         return
