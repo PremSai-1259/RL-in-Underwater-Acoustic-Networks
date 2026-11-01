@@ -26,7 +26,7 @@ The optional argument is the packet count per experiment. The program prints res
 
 The eight-node topology, locations, node energy, physical constants, Q-learning values, and scenarios are in [routing_agent.groovy](routing_agent.groovy). Nodes are `N0` through `N7`; `N0` is the source and `N7` is the destination.
 
-`8-node-network.groovy` runs the matching real-time UnetStack topology. It loads `EnergyAwareRoutingAgent.groovy` on every node. Each agent owns only its own residual-energy model and local `Q[destination][nextHop]` values, then installs its selected next hop into the standard UnetStack Router. The centralized energy lists in `routing_agent.groovy` are deliberately limited to the offline experiment; they are not used by the live agent.
+`8-node-network.groovy` runs the matching real-time UnetStack topology. It loads `EnergyAwareRoutingAgent.groovy` on every node. Each agent owns only its own residual-energy model and local `Q[destination][nextHop]` values, then installs its selected next hop into the standard UnetStack Router. The live Q-table is partitioned by a canonical network-condition state: the sorted failed-node set and sorted failed-link set. Reapplying the same failures in a different order reuses the same state/table. The centralized energy lists in `routing_agent.groovy` are deliberately limited to the offline experiment; they are not used by the live agent.
 
 ## Real-time UnetStack demo
 
@@ -60,7 +60,7 @@ Set a **single** local energy value on each node; lists are rejected so a node c
 rlroute.energy = 40.0
 ```
 
-The live agent uses the same model as the simulation: 128-byte packets at 10 kbps give 0.1024 s airtime, 1.024 J transmit energy, 0.2048 J receive energy, 0.05 J per routing decision, and a 0.10 J reserve. A local `DatagramTransmissionNtf` charges the decision plus transmit cost exactly once for each acoustic send attempt (including a real retry). A `DatagramNtf` confirms successful local delivery and charges reception once. Residual energy is clamped at zero and triggers a route refresh.
+The live agent uses a feasibility model of 128-byte packets at 10 kbps: 0.1024 s airtime, 1.500 J transmit energy, 0.2048 J receive energy, 0.05 J per routing decision, and a 0.10 J reserve. It checks that a selected relay has enough energy to receive, process, and forward. For the current demonstration, `DEBIT_DATA_ENERGY` is `false`: send/receive costs are logged but do not drain a node while forwarding. Change that single constant to `true` when you want dynamic battery depletion. Set initial energies in `INITIAL_ENERGY`, or set a node's own energy with `rlroute.energy`.
 
 Every node automatically requests each direct neighbour's energy estimate at startup and then at most once per minute. The request and reply use a dedicated EAFTR application datagram protocol over one-hop ECLink, so a node receives the estimate from its neighbour rather than reading a remote variable. Replies carry the neighbour's residual energy, sequence number and timestamp; each node keeps only its own cache, and snapshots expire after 90 seconds. Missing or stale energy makes that next hop infeasible. The control datagrams use their actual small payload length for TX/RX energy accounting, while data forwarding keeps the 128-byte model. `neighborInfo` is read-only and displays the received local cache.
 

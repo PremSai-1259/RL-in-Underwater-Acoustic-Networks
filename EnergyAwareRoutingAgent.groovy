@@ -6,107 +6,101 @@ import org.arl.unet.link.LinkStatusNtf
 import org.arl.unet.net.*
 import org.arl.unet.nodeinfo.NodeInfoParam
 
-class EAFTRAgent extends UnetAgent {
+class EnergyAwareRoutingAgent extends UnetAgent {
 
   enum Params implements Parameter {
-    destination, energy, neighborInfo, qtable, nextHops, stats,
-    failedLinks, failedNodes
+    destination, energy, failedLinks, failedNodes, episodes,
+    neighborInfo, qtable, routes, traceRoute, debug
   }
 
-  static final String title = 'EAFTR Energy-Aware Routing'
-  static final String description = 'Reinforcement learning based energy-aware fault-tolerant routing'
+  static final String title = 'EAFTR Q-learning routing'
+  static final String description = 'Energy-aware fault-tolerant routing'
+  static final int energyProtocol = Protocol.USER + 1
 
-  static final int EAFTR_PROTOCOL = Protocol.USER + 1
-  static final int DATA_PROTOCOL = Protocol.USER + 2
+  static final double packetBytes = 128d
+  static final double dataRate = 10000d
+  static final double txPower = 14.65d
+  static final double rxPower = 2d
+  static final double routingCost = 0.05d
+  static final double energyReserve = 0.10d
 
-  static final double ALPHA = 0.15d
-  static final double GAMMA = 0.90d
-  static final double EPSILON = 0.05d
-
-  static final double DATA_BYTES = 128d
-  static final double DATA_RATE_BPS = 10000d
-  static final double TX_POWER_W = 10d
-  static final double RX_POWER_W = 2d
-  static final double ROUTING_COST_J = 0.05d
-  static final double RESERVE_J = 0.10d
-
-  static final long ADVERTISE_MS = 10000L
-  static final long REQUEST_MS = 15000L
-  static final long ENERGY_TTL_MS = 60000L
-  static final long DEBOUNCE_MS = 500L
-  static final long ACK_TIMEOUT_MS = 8000L
-  static final long SUSPECT_MS = 30000L
-
-  static final int ADVERT_HOPS = 8
-  static final int MAX_TTL = 10
-  static final int MAX_RETRIES = 3
-
-  static final Map<Integer,Double> INITIAL_ENERGY = [
-    1:100d, 2:75d, 3:90d, 4:80d,
-    5:45d, 6:85d, 7:70d, 8:100d
+  static final Map<Integer, Double> INITIAL_ENERGY = [
+    1: 100d, 2: 80d, 3: 85d, 4: 0d,
+    5: 65d, 6: 70d, 7: 90d, 8: 100d
   ]
 
-  final Map<Integer,List<Integer>> neighbors = [
-    1:[2,3],
-    2:[1,4,5],
-    3:[1,5,6],
-    4:[2,7],
-    5:[2,3,7],
-    6:[3,7],
-    7:[4,5,6,8],
-    8:[7]
-  ]
+  // Keep this false for the current demonstration. Energy is still checked
+  // before selecting a relay, but forwarding does not silently drain nodes.
+  // Set it to true only when you want dynamic battery depletion.
+  static final boolean DEBIT_DATA_ENERGY = false
 
-  final Map<Integer,List<Double>> position = [
-    1:[0d,0d,-10d],
-    2:[100d,0d,-15d],
-    3:[0d,100d,-20d],
-    4:[200d,0d,-20d],
-    5:[100d,100d,-25d],
-    6:[0d,200d,-15d],
-    7:[250d,100d,-20d],
-    8:[350d,100d,-10d]
-  ]
-
-  int address = -1
+  double alpha = 0.15d
+  double gamma = 0.90d
+  int episodes = 800
   int destination = 8
-  int sequence = 0
 
-  double energyJ = 100d
-  long energyVersion = 0L
-
-  boolean training = false
-  boolean publishScheduled = false
+  private double initialEnergy = 100d
+  private double residualEnergy = 100d
 
   Set<String> failedLinks = [] as Set<String>
   Set<Integer> failedNodes = [] as Set<Integer>
 
-  private AgentID router
-  private AgentID link
-
-  private final Random rng = new Random(42)
-
-  private Map<Integer,Map> neighbourState = [:]
-  private Map<Integer,Map<Integer,Double>> q = [:]
-  private Map<Integer,Integer> activeRoutes = [:]
-  private Map<Integer,Double> observedLQ = [:]
-  private Map<Integer,Long> suspectUntil = [:]
-  private Map<String,Map> pending = [:]
-  private Set<String> seen = new HashSet<String>()
-
-  private Map<String,Number> stat = [
-    generated:0,
-    delivered:0,
-    txData:0,
-    txCtl:0,
-    failedFwd:0,
-    noRoute:0,
-    duplicates:0,
-    routeChanges:0,
-    staleEvents:0
+  final Map<Integer, List<Integer>> neighbors = [
+    1: [2, 3],
+    2: [1, 4, 5],
+    3: [1, 5, 6],
+    4: [2, 7],
+    5: [2, 3, 7],
+    6: [3, 7],
+    7: [4, 5, 6, 8],
+    8: [7]
   ]
 
-  private double totalDelayMs = 0d
+  final Map<Integer, List<Double>> position = [
+    1: [0d, 0d, -10d],
+    2: [100d, 0d, -15d],
+    3: [0d, 100d, -20d],
+    4: [200d, 0d, -20d],
+    5: [100d, 100d, -25d],
+    6: [0d, 200d, -15d],
+    7: [250d, 100d, -20d],
+    8: [350d, 100d, -10d]
+  ]
+
+  private AgentID router
+  private AgentID link
+  private int address = -1
+
+  // A state is the canonical set of permanent failed nodes and links. Thus
+  // [failedNodes:[4], failedLinks:["2-5"]] always addresses the same table,
+  // regardless of assignment order or input formatting.
+  private Map<String, Map<Integer, Map<Integer, Double>>> qTablesByState = [:]
+  private Map<String, Map<Integer, Set<Integer>>> bootstrappedByState = [:]
+  private Map<Integer, Map> neighborCache = [:]
+
+  private Map<Integer, Integer> installedNextHops = [:]
+  private Map<Integer, Long> lastEnergyRequestAt = [:]
+  private Map<Integer, List<Double>> pendingControlTxCost = [:]
+
+  private long localAdvertisementSequence = 0L
+  private long lastEnergyAdvertisementAt = 0L
+  private double lastAdvertisedEnergy = Double.NaN
+  private boolean refreshQueued = false
+
+  private String debugStatus = 'Agent initialized; waiting for startup.'
+  private String routesResult = 'Set rlroute.routes to a destination.'
+  private String traceRouteResult = 'Set rlroute.traceRoute to a destination.'
+
+  static final long NEIGHBOR_TTL_MS = 90000L
+  // The topology has configured initial energy and the demonstration does not
+  // deplete batteries. Keep the last reported energy usable after its age
+  // exceeds NEIGHBOR_TTL_MS; otherwise every route disappears after 90 s if a
+  // control advertisement is missed.
+  static final boolean REQUIRE_FRESH_NEIGHBOR_ENERGY = false
+  static final long NEIGHBOR_QUERY_MS = 5000L
+  static final long ADVERTISEMENT_INTERVAL_MS = 5000L
+  static final long MIN_ADVERT_GAP_MS = 2000L
+  static final double ENERGY_CHANGE_THRESHOLD_J = 1.0d
 
   @Override
   List<Parameter> getParameterList() {
@@ -114,14 +108,19 @@ class EAFTRAgent extends UnetAgent {
   }
 
   boolean isReadOnly(Parameter p) {
-    p == Params.neighborInfo ||
-    p == Params.qtable ||
-    p == Params.nextHops ||
-    p == Params.stats
+    p == Params.qtable || p == Params.neighborInfo || p == Params.debug
+  }
+
+  private void setDebugStatus(String message) {
+    debugStatus = "${new Date()} | ${message}"
+  }
+
+  String getDebug() {
+    debugStatus
   }
 
   double getEnergy() {
-    energyJ
+    residualEnergy
   }
 
   void setEnergy(Object value) {
@@ -129,42 +128,55 @@ class EAFTRAgent extends UnetAgent {
         !Double.isFinite(value as double) ||
         (value as double) < 0d) {
       throw new IllegalArgumentException(
-        'Energy must be a non-negative number'
+        'energy must be a non-negative number of joules'
       )
     }
 
-    energyJ = value as double
-    energyVersion++
-    updateOwnEnergy()
-    refreshPolicy('energy manually changed')
-    publishEnergy()
+    residualEnergy = value as double
+
+    setDebugStatus(
+      "LOCAL ENERGY SET: node=${address}, energy=${residualEnergy} J"
+    )
+
+    log.info("EAFTR: node ${address} energy set to ${residualEnergy} J")
+
+    refreshQValues()
+    queueRefresh()
+
+    lastAdvertisedEnergy = Double.NaN
+    lastEnergyAdvertisementAt = 0L
+
+    advertiseEnergyIfChanged(true)
   }
 
   String getNeighborInfo() {
-    long now = System.currentTimeMillis()
+    if (neighborCache.isEmpty()) {
+      return 'No neighbour energy information available.'
+    }
 
-    neighbourState.keySet().sort().collect { int n ->
-      Map s = neighbourState[n]
-      long age = now - (s.receivedAt as long)
+    neighborCache.keySet().sort().collect { int node ->
+      Map n = neighborCache[node]
+      long age = System.currentTimeMillis() - (n.time as long)
 
-      "${n}: ${fmt(s.energy as double)} J, " +
-      "version=${s.version}, age=${age}ms" +
-      "${age > ENERGY_TTL_MS ? ' STALE' : ''}"
+      "${node}: energy=${String.format('%.3f', n.energy as double)} J, age=${age} ms"
     }.join('\n')
   }
 
   String getQtable() {
-    if (address < 1) return 'Agent is starting.'
+    if (address < 1) return 'Agent is still starting.'
 
-    StringBuilder out =
-      new StringBuilder("EAFTR Q-table at node ${address}\n")
+    Map<Integer, Map<Integer, Double>> qTables = currentQTables()
+    StringBuilder out = new StringBuilder()
+    out.append("EAFTR Q-table at node ${address}; state=${networkStateKey()}\n")
+    out.append('Q[destination][nextHop]\n')
 
-    q.keySet().sort().each { int d ->
-      out.append("Destination ${d}\n")
+    qTables.keySet().sort().each { int target ->
+      out.append("\nDestination ${target}\n")
 
-      (neighbors[address] ?: []).sort().each { int n ->
+      qTables[target].keySet().sort().each { int hop ->
+        double value = qTables[target][hop] ?: 0d
         out.append(
-          "  Next hop ${n}: Q = ${fmt(q[d]?.get(n) ?: 0d)}\n"
+          "  NextHop ${hop}: Q = ${String.format('%.2f', value)}\n"
         )
       }
     }
@@ -172,54 +184,93 @@ class EAFTRAgent extends UnetAgent {
     out.toString()
   }
 
-  String getNextHops() {
-    activeRoutes.keySet().sort().collect { int d ->
-      "destination=${d}, nextHop=${activeRoutes[d]}"
-    }.join('\n')
+  String getRoutes() {
+    routesResult
   }
 
-  String getStats() {
-    "node=${address}, generated=${stat.generated}, " +
-    "delivered=${stat.delivered}, txData=${stat.txData}, " +
-    "failed=${stat.failedFwd}, noRoute=${stat.noRoute}, " +
-    "energy=${fmt(energyJ)} J, avgDelayMs=" +
-    "${stat.delivered ? fmt(totalDelayMs / (stat.delivered as double)) : 'n/a'}"
+  void setRoutes(int target) {
+    routesResult = calculateRoute(target)
+    log.info(routesResult)
   }
 
-  void setDestination(int d) {
-    if (!neighbors.containsKey(d)) {
-      throw new IllegalArgumentException('Unknown destination')
+  String getTraceRoute() {
+    traceRouteResult
+  }
+
+  void setTraceRoute(int target) {
+    traceRouteResult = calculateTraceRoute(target)
+    log.info(traceRouteResult)
+  }
+
+  private String calculateRoute(int target) {
+    if (address < 1) return 'Agent is still starting.'
+    if (!neighbors.containsKey(target)) return "Invalid destination ${target}."
+    if (target == address) return "Already at destination ${target}."
+
+    Map<Integer, Double> values = localTable(target)
+    recalculateDestinationQValues(target, values)
+
+    Integer next = bestLocalAction(target, values)
+
+    if (next == null) {
+      return "No feasible next hop from ${address} to ${target}."
     }
 
-    destination = d
-    refreshPolicy('destination changed')
+    "Node ${address} -> destination ${target}: nextHop=${next}, Q=${String.format('%.2f', values[next])}"
   }
 
-  void failNode(int n) {
-    failedNodes.add(n)
-    refreshPolicy("node ${n} failed")
-  }
+  private String calculateTraceRoute(int target) {
+    if (address < 1) return 'Agent is still starting.'
+    if (!neighbors.containsKey(target)) return "Invalid destination ${target}."
+    if (target == address) return "Route: ${address}"
 
-  void restoreNode(int n) {
-    failedNodes.remove(n)
-    suspectUntil.remove(n)
-    refreshPolicy("node ${n} restored")
-  }
+    List<Integer> path = [address]
+    Set<Integer> visited = [address] as Set<Integer>
+    int current = address
 
-  void failLink(int a, int b) {
-    failedLinks.add(edgeKey(a,b))
-    refreshPolicy("link ${a}-${b} failed")
-  }
+    while (current != target && path.size() <= neighbors.size()) {
+      Integer next
 
-  void restoreLink(int a, int b) {
-    failedLinks.remove(edgeKey(a,b))
-    refreshPolicy("link ${a}-${b} restored")
-  }
+      if (current == address) {
+        Map<Integer, Double> values = localTable(target)
+        recalculateDestinationQValues(target, values)
+        next = bestLocalAction(target, values, visited)
+      } else {
+        List<Integer> options = (neighbors[current] ?: []).findAll { int n ->
+          !visited.contains(n) &&
+          !failedNodes.contains(n) &&
+          !failedLinks.contains(key(current, n)) &&
+          relayEnergyFeasible(n, target) &&
+          pathExists(n, visited, target)
+        }
 
-  void sendTest(int count = 1) {
-    count.times {
-      sendData(destination)
+        if (options.isEmpty()) {
+          return "No complete route. Partial route: ${path.join(' -> ')}"
+        }
+
+        options.sort { int a, int b ->
+          int da = shortestDistance(a, target)
+          int db = shortestDistance(b, target)
+          da <=> db ?: a <=> b
+        }
+
+        next = options[0]
+      }
+
+      if (next == null || visited.contains(next)) {
+        return "No complete route. Partial route: ${path.join(' -> ')}"
+      }
+
+      path.add(next)
+      visited.add(next)
+      current = next
     }
+
+    if (current != target) {
+      return "No complete route. Partial route: ${path.join(' -> ')}"
+    }
+
+    "Predicted route: ${path.join(' -> ')}"
   }
 
   @Override
@@ -227,748 +278,854 @@ class EAFTRAgent extends UnetAgent {
     router = agentForService(Services.ROUTING)
     link = agentForService(Services.LINK)
 
-    subscribe topic(Topics.DATAGRAM)
     if (link != null) subscribe topic(link)
 
+    subscribe topic(Topics.DATAGRAM)
+
     add new WakerBehavior(1000, {
-      try {
-        def nodeAgent = agentForService(Services.NODE_INFO)
-        address = get(nodeAgent, NodeInfoParam.address) as int
-        energyJ = INITIAL_ENERGY[address] ?: 100d
+      def info = agentForService(Services.NODE_INFO)
+      address = get(info, NodeInfoParam.address) as int
 
-        seedEnergyEstimates()
-        initialiseTables()
-        updateOwnEnergy()
+      setDebugStatus("STARTUP COMPLETE: node=${address}")
 
-        log.info(
-          "EAFTR START node=${address}, energy=${fmt(energyJ)}, " +
-          "router=${router}, link=${link}"
-        )
+      // Do not use Groovy's ?: here: 0d is a valid configured energy, but
+      // ?: treats zero as false and would incorrectly replace it with 100 J.
+      initialEnergy = INITIAL_ENERGY.containsKey(address) ?
+        INITIAL_ENERGY[address] : 100d
+      residualEnergy = initialEnergy
 
-        refreshPolicy('startup')
-        publishEnergy()
-        sendControl(null, 'R')
+      long now = System.currentTimeMillis()
 
-        scheduleAdvertisement()
-        scheduleEnergyRequests()
-
-      } catch (Exception ex) {
-        log.severe(
-          "EAFTR STARTUP ERROR ${ex.class.simpleName}: ${ex.message}"
-        )
+      (neighbors[address] ?: []).each { int node ->
+        neighborCache[node] = [
+          energy: INITIAL_ENERGY.containsKey(node) ? INITIAL_ENERGY[node] : 100d,
+          sequence: 0L,
+          time: now,
+          advertisedAt: now
+        ]
       }
+
+      initializeTables()
+      refreshQValues()
+      refreshPolicy()
+
+      log.info(
+        "EAFTR started at node ${address}, energy=${residualEnergy} J"
+      )
+
+      requestNeighborEnergy()
+      advertiseEnergyIfChanged(true)
+
+      scheduleNeighborRequests()
+      scheduleAdvertisements()
     })
   }
 
   @Override
   void processMessage(Message msg) {
-    if (msg instanceof DatagramNtf) {
-      if (msg.protocol == EAFTR_PROTOCOL ||
-          msg.protocol == DATA_PROTOCOL) {
-        handleDatagram(msg)
-      }
-      return
-    }
-
-    if (msg instanceof LinkStatusNtf &&
-        msg.sender == link &&
-        address > 0) {
-
-      int peer = msg.to as int
-      if (!(neighbors[address] ?: []).contains(peer)) return
-
-      if (msg.up) {
-        failedLinks.remove(edgeKey(address,peer))
-      } else {
-        failedLinks.add(edgeKey(address,peer))
-      }
-
-      refreshPolicy("link status changed: ${peer}")
-    }
-  }
-
-  private void seedEnergyEstimates() {
-    long now = System.currentTimeMillis()
-
-    INITIAL_ENERGY.each { int n, double e ->
-      neighbourState[n] = [
-        energy:e,
-        version:0L,
-        receivedAt:now,
-        sentAt:now,
-        estimated:true
-      ]
-    }
-  }
-
-  private void initialiseTables() {
-    neighbors.keySet().each { int d ->
-      if (!q.containsKey(d)) q[d] = [:]
-
-      (neighbors[address] ?: []).each { int n ->
-        if (!q[d].containsKey(n)) q[d][n] = 0d
-      }
-    }
-  }
-
-  private void scheduleAdvertisement() {
-    add new WakerBehavior(ADVERTISE_MS, {
-      if (address > 0) {
-        publishEnergy()
-        scheduleAdvertisement()
-      }
-    })
-  }
-
-  private void scheduleEnergyRequests() {
-    add new WakerBehavior(REQUEST_MS, {
-      if (address > 0) {
-        sendControl(null,'R')
-        scheduleEnergyRequests()
-      }
-    })
-  }
-
-  private double txEnergy(double bytes) {
-    TX_POWER_W * bytes * 8d / DATA_RATE_BPS
-  }
-
-  private double rxEnergy(double bytes) {
-    RX_POWER_W * bytes * 8d / DATA_RATE_BPS
-  }
-
-  private void updateOwnEnergy() {
-    long now = System.currentTimeMillis()
-
-    neighbourState[address] = [
-      energy:energyJ,
-      version:energyVersion,
-      receivedAt:now,
-      sentAt:now,
-      estimated:false
-    ]
-  }
-
-  private void charge(double joules, boolean publishIt = false) {
-    if (address < 1 || joules <= 0d) return
-
-    energyJ = Math.max(0d,energyJ-joules)
-    energyVersion++
-    updateOwnEnergy()
-
-    if (energyJ <= RESERVE_J) {
-      log.warning(
-        "EAFTR ENERGY_LOW node=${address}, energy=${fmt(energyJ)}"
-      )
-    }
-
-    refreshPolicy('energy consumed')
-
-    if (publishIt && !publishScheduled) {
-      publishScheduled = true
-
-      add new WakerBehavior(DEBOUNCE_MS, {
-        publishScheduled = false
-        publishEnergy()
-      })
-    }
-  }
-
-  private void publishEnergy() {
     if (address < 1) return
 
-    updateOwnEnergy()
+    if (msg instanceof DatagramNtf) {
+      // Ignore datagrams overheard for other nodes.
+      // Only process datagrams addressed to this node or broadcast.
+      if (msg.to != address && msg.to != 0) return
 
-    String payload =
-      "E|${address}|${fmt(energyJ)}|${energyVersion}|${ADVERT_HOPS}"
-
-    sendControl(null,payload)
-  }
-
-  private void sendControl(Integer target, String payload) {
-    List<Integer> targets = target == null
-      ? (neighbors[address] ?: [])
-      : [target]
-
-    targets.each { int n ->
-      if (!failedNodes.contains(n) &&
-          !failedLinks.contains(edgeKey(address,n))) {
-        transmit(n,EAFTR_PROTOCOL,payload,false)
-      }
-    }
-  }
-
-  private boolean transmit(
-    int target,
-    int protocol,
-    String payload,
-    boolean dataPacket
-  ) {
-    if (failedNodes.contains(address) ||
-        failedNodes.contains(target) ||
-        failedLinks.contains(edgeKey(address,target))) {
-      return false
-    }
-
-    if (link == null) {
-      log.warning('EAFTR: link agent is unavailable')
-      return false
-    }
-
-    byte[] bytes = payload.getBytes('UTF-8')
-
-    double cost = dataPacket
-      ? txEnergy(DATA_BYTES)
-      : txEnergy(bytes.length as double)
-
-    if (energyJ < cost + RESERVE_J) {
-      log.warning("EAFTR TX_SKIPPED node=${address}: insufficient energy")
-      return false
-    }
-
-    charge(cost,dataPacket)
-
-    try {
-      send new DatagramReq(
-        recipient:link,
-        to:target,
-        protocol:protocol,
-        reliability:false,
-        data:bytes
+      setDebugStatus(
+        "DATAGRAM RECEIVED: node=${address}, from=${msg.from}, protocol=${msg.protocol}"
       )
 
-      if (dataPacket) {
-        stat.txData++
+      if (msg.protocol == energyProtocol) {
+        handleEnergyDatagram(msg)
+        return
+      }
+
+      double bytes = msg.data?.length ?: 0d
+
+      debitDataEnergy(
+        rxEnergy(bytes) + routingCost,
+        'data reception and processing',
+        true
+      )
+
+      log.info(
+        "EAFTR: data received at node ${address} from ${msg.from}, bytes=${bytes}"
+      )
+
+      return
+    }
+
+    if (msg.sender != link) return
+
+    if (msg instanceof DatagramTransmissionNtf) {
+      List<Double> costs = pendingControlTxCost[msg.to]
+      boolean isControl = costs != null && !costs.isEmpty()
+
+      if (isControl) {
+        costs.remove(0)
+
+        if (costs.isEmpty()) {
+          pendingControlTxCost.remove(msg.to)
+        }
+
+        log.info(
+          "EAFTR: energy-control transmission to ${msg.to}; battery unchanged"
+        )
       } else {
-        stat.txCtl++
-      }
+        debitDataEnergy(
+          txEnergy(packetBytes) + routingCost,
+          'data transmission and routing decision',
+          true
+        )
 
-      if (protocol == EAFTR_PROTOCOL && payload.startsWith('E|')) {
-        log.info("EAFTR ENERGY_TX node=${address} to=${target}")
-      }
-
-      return true
-
-    } catch (Exception ex) {
-      log.warning(
-        "EAFTR TX_ERROR to=${target}: ${ex.class.simpleName}: ${ex.message}"
-      )
-      return false
-    }
-  }
-
-  private void handleDatagram(DatagramNtf msg) {
-    if (address < 1 || failedNodes.contains(address)) return
-
-    int from = msg.from as int
-
-    if (!(neighbors[address] ?: []).contains(from)) return
-    if (failedLinks.contains(edgeKey(address,from))) return
-
-    byte[] raw = msg.data as byte[]
-    boolean dataPacket = msg.protocol == DATA_PROTOCOL
-
-    double cost = dataPacket
-      ? rxEnergy(DATA_BYTES)
-      : rxEnergy((raw?.length ?: 0) as double)
-
-    if (energyJ < cost + RESERVE_J) return
-
-    charge(cost,dataPacket)
-    charge(ROUTING_COST_J)
-
-    String payload
-    try {
-      payload = new String(raw,'UTF-8').trim()
-    } catch (Exception ex) {
-      return
-    }
-
-    String[] p = payload.split('\\|',-1)
-
-    try {
-      if (dataPacket) {
-        onData(from,p)
-      } else if (p[0] == 'R') {
-        sendOwnEnergy(from)
-      } else if (p[0] == 'E' && p.length == 5) {
-        onEnergy(from,p)
-      } else if (p[0] == 'A' && p.length == 3) {
-        onAck(from,p)
-      }
-    } catch (Exception ex) {
-      log.warning(
-        "EAFTR BAD_MESSAGE from=${from}: ${ex.class.simpleName}: ${ex.message}"
-      )
-    }
-  }
-
-  private void sendOwnEnergy(int target) {
-    String payload =
-      "E|${address}|${fmt(energyJ)}|${energyVersion}|1"
-
-    sendControl(target,payload)
-  }
-
-  private void onEnergy(int from, String[] p) {
-    int origin = p[1] as int
-    double e = p[2] as double
-    long version = p[3] as long
-    int ttl = p[4] as int
-
-    if (!INITIAL_ENERGY.containsKey(origin) || origin == address) return
-    if (!Double.isFinite(e) || e < 0d || ttl < 1) return
-
-    Map old = neighbourState[origin]
-
-    if (old != null &&
-        old.estimated != true &&
-        version <= (old.version as long)) {
-      stat.duplicates++
-      return
-    }
-
-    neighbourState[origin] = [
-      energy:e,
-      version:version,
-      receivedAt:System.currentTimeMillis(),
-      sentAt:System.currentTimeMillis(),
-      estimated:false
-    ]
-
-    log.info(
-      "EAFTR ENERGY_UPDATED node=${address}, origin=${origin}, " +
-      "energy=${fmt(e)}, version=${version}"
-    )
-
-    refreshPolicy("energy update from ${origin}")
-
-    if (ttl > 1) {
-      (neighbors[address] ?: []).findAll {
-        it != from && it != origin
-      }.each { int n ->
-        sendControl(
-          n,
-          "E|${origin}|${fmt(e)}|${version}|${ttl-1}"
+        log.info(
+          "EAFTR: data transmission from node ${address} to ${msg.to}"
         )
       }
+
+      return
+    }
+
+    if (msg instanceof LinkStatusNtf) {
+      if ((neighbors[address] ?: []).contains(msg.to)) {
+        log.info(
+          "EAFTR: physical link notification ${address}-${msg.to}, up=${msg.up}; manual failure mode unchanged"
+        )
+      }
+
+      return
     }
   }
 
-  private double freshEnergy(int n) {
-    Map s = neighbourState[n]
-    if (s == null) return -1d
+  void setFailedLinks(Object values) {
+    Collection items
 
-    long age = System.currentTimeMillis() - (s.receivedAt as long)
+    if (values == null) {
+      items = []
+    } else if (values instanceof Collection) {
+      items = values as Collection
+    } else {
+      items = [values]
+    }
 
-    if (age > ENERGY_TTL_MS) return -1d
+    Set<String> configured = items.collect { item ->
+      String edge = item.toString().trim().replaceAll('\\s+', '')
+      def match = edge =~ /^(\d+)[-:,](\d+)$/
 
-    s.energy as double
+      if (match.matches()) {
+        key(match[0][1] as int, match[0][2] as int)
+      } else {
+        throw new IllegalArgumentException("Invalid link '${item}'; use node-node, e.g. 2-5")
+      }
+    }.toSet() as Set<String>
+
+    Set<String> unknown = configured.findAll { String edge ->
+      List<String> endpoints = edge.split('-') as List<String>
+      int left = endpoints[0] as int
+      int right = endpoints[1] as int
+      !(neighbors[left] ?: []).contains(right)
+    } as Set<String>
+    if (!unknown.isEmpty()) {
+      throw new IllegalArgumentException("Not a topology link: ${unknown.sort()}")
+    }
+
+    failedLinks = configured
+
+    log.info("EAFTR: manually configured failed links = ${failedLinks}")
+
+    refreshQValues()
+    queueRefresh()
   }
 
-  private boolean suspect(int n) {
-    Long until = suspectUntil[n]
-    until != null && until > System.currentTimeMillis()
+  void setFailedNodes(Object values) {
+    Collection items = values == null ? [] :
+      (values instanceof Collection ? values as Collection : [values])
+
+    Set<Integer> configured = items.collect { it as int } as Set<Integer>
+    Set<Integer> unknown = configured.findAll { !neighbors.containsKey(it) } as Set<Integer>
+    if (!unknown.isEmpty()) {
+      throw new IllegalArgumentException("Unknown node address(es): ${unknown.sort()}")
+    }
+
+    failedNodes = configured
+
+    log.info("EAFTR: manually configured failed nodes = ${failedNodes}")
+
+    refreshQValues()
+    queueRefresh()
   }
 
-  private boolean canTransmit() {
-    energyJ >= txEnergy(DATA_BYTES) + ROUTING_COST_J + RESERVE_J
+  void setDestination(int value) {
+    if (!neighbors.containsKey(value)) {
+      throw new IllegalArgumentException('Unknown destination.')
+    }
+
+    destination = value
+    queueRefresh()
   }
 
-  private boolean feasible(int n, int d) {
-    if (n == address ||
-        failedNodes.contains(n) ||
-        failedNodes.contains(address)) return false
+  void setEpisodes(int value) {
+    if (value < 1) {
+      throw new IllegalArgumentException('episodes must be positive')
+    }
 
-    if (failedLinks.contains(edgeKey(address,n)) || suspect(n)) return false
+    episodes = value
+    refreshQValues()
+    queueRefresh()
+  }
 
-    double e = freshEnergy(n)
-    if (e < 0d) return false
+  private void initializeTables() {
+    if (address < 1) return
 
-    double required = n == d
-      ? rxEnergy(DATA_BYTES) + RESERVE_J
-      : rxEnergy(DATA_BYTES) + txEnergy(DATA_BYTES) +
-        ROUTING_COST_J + RESERVE_J
+    neighbors.keySet().each { int target ->
+      if (target != address) localTable(target)
+    }
+  }
 
-    if (e < required) return false
+  private Map<Integer, Double> localTable(int target) {
+    Map<Integer, Map<Integer, Double>> qTables = currentQTables()
+    if (!qTables.containsKey(target)) {
+      qTables[target] = (neighbors[address] ?: []).collectEntries {
+        int hop -> [(hop): 0d]
+      }
+    }
 
-    pathExists(n,d,[address] as Set<Integer>)
+    qTables[target]
+  }
+
+  private void refreshQValues() {
+    if (address < 1) return
+
+    initializeTables()
+
+    Map<Integer, Map<Integer, Double>> qTables = currentQTables()
+    qTables.keySet().each { int target ->
+      recalculateDestinationQValues(target, qTables[target])
+    }
+  }
+
+  private String networkStateKey() {
+    String nodes = failedNodes.toList().sort().join(',')
+    String links = failedLinks.toList().sort().join(',')
+    "nodes=[${nodes}];links=[${links}]"
+  }
+
+  private Map<Integer, Map<Integer, Double>> currentQTables() {
+    String state = networkStateKey()
+    if (!qTablesByState.containsKey(state)) qTablesByState[state] = [:]
+    qTablesByState[state]
+  }
+
+  private Map<Integer, Set<Integer>> currentBootstrappedActions() {
+    String state = networkStateKey()
+    if (!bootstrappedByState.containsKey(state)) bootstrappedByState[state] = [:]
+    bootstrappedByState[state]
+  }
+
+  private void recalculateDestinationQValues(
+    int target,
+    Map<Integer, Double> values
+  ) {
+    Map<Integer, Set<Integer>> bootstrappedActions = currentBootstrappedActions()
+    Set<Integer> trained = bootstrappedActions[target]
+
+    if (trained == null) {
+      trained = [] as Set<Integer>
+      bootstrappedActions[target] = trained
+    }
+
+    (neighbors[address] ?: []).each { int hop ->
+      if (!isActionFeasible(hop, target)) {
+        values[hop] = -10d
+        return
+      }
+
+      double r = reward(address, hop, target)
+
+      // A hop may have been marked -10 while a failure/low-energy condition
+      // was active. When that condition clears, bootstrap it again instead of
+      // only making one tiny alpha update from the failure penalty.
+      if (!trained.contains(hop) || (values[hop] ?: 0d) <= -10d) {
+        values[hop] = 0d
+        episodes.times {
+          values[hop] += alpha * (r - values[hop])
+        }
+
+        trained.add(hop)
+      } else {
+        values[hop] += alpha * (r - values[hop])
+      }
+    }
+  }
+
+  private Integer bestLocalAction(
+    int target,
+    Map<Integer, Double> values,
+    Set<Integer> visited = [] as Set<Integer>
+  ) {
+    List<Integer> options = actions(target, visited)
+
+    if (options.isEmpty()) return null
+
+    double best = options.collect {
+      values[it] ?: 0d
+    }.max() as double
+
+    List<Integer> ties = options.findAll {
+      Math.abs((values[it] ?: 0d) - best) < 1e-9
+    }
+
+    ties.sort { int a, int b ->
+      double ra = reward(address, a, target)
+      double rb = reward(address, b, target)
+
+      rb <=> ra ?: a <=> b
+    }
+
+    ties[0]
+  }
+
+  private List<Integer> actions(
+    int target,
+    Set<Integer> visited
+  ) {
+    if (failedNodes.contains(address) || !canTransmitLocal()) {
+      return []
+    }
+
+    (neighbors[address] ?: []).findAll { int next ->
+      !visited.contains(next) &&
+      isActionFeasible(next, target) &&
+      pathExists(next, visited, target)
+    }
+  }
+
+  private boolean isActionFeasible(int node, int target) {
+    // This method is used both by route selection and Q-value refresh. Keep
+    // the local transmit test here so a zero-energy source cannot retain old
+    // positive Q-values while actions() correctly reports no route.
+    if (failedNodes.contains(address) || !canTransmitLocal()) return false
+    if (failedNodes.contains(node)) return false
+    if (failedNodes.contains(target)) return false
+    if (failedLinks.contains(key(address, node))) return false
+    if (!(neighbors[address] ?: []).contains(node)) return false
+
+    int currentDistance = shortestDistance(address, target)
+    int nextDistance = shortestDistance(node, target)
+
+    if (currentDistance == Integer.MAX_VALUE ||
+        nextDistance == Integer.MAX_VALUE ||
+        nextDistance >= currentDistance) {
+      return false
+    }
+
+    double energy = freshNeighborEnergy(node)
+    if (energy < 0d) return false
+
+    double required = node == target
+      ? rxEnergy() + energyReserve
+      : rxEnergy() + txEnergy() + routingCost + energyReserve
+
+    energy >= required
+  }
+
+  private double reward(int from, int to, int target) {
+    if (to == target) return 100d
+
+    double battery = 10d * freshNeighborEnergy(to) /
+      Math.max(1d, INITIAL_ENERGY[to] ?: 100d)
+
+    double linkQuality = 5d * Math.exp(-distance(from, to) / 500d)
+
+    double progress =
+      (distance(from, target) - distance(to, target)) / 100d
+
+    battery + linkQuality + progress -
+      2d * (txEnergy() + rxEnergy() + routingCost) - 1d
   }
 
   private boolean pathExists(
     int start,
-    int target,
-    Set<Integer> blocked
+    Set<Integer> visited,
+    int target
   ) {
-    if (start == target) return true
+    def queue = new ArrayDeque<Integer>()
+    Set<Integer> seen = [] as Set<Integer>
 
-    ArrayDeque<Integer> queue = new ArrayDeque<Integer>()
-    Set<Integer> visited = new HashSet<Integer>(blocked)
+    // This is a modelled end-to-end feasibility search. A node must have
+    // enough energy to receive the current packet and, unless it is the
+    // destination, make one forwarding transmission. This makes an initial
+    // energy of 0 on an intermediate node remove it from predicted routes.
+    if (!relayEnergyFeasible(start, target)) return false
 
     queue.add(start)
-    visited.add(start)
+    seen.add(start)
 
     while (!queue.isEmpty()) {
-      int u = queue.removeFirst()
+      int current = queue.removeFirst()
 
-      for (int v : (neighbors[u] ?: [])) {
-        if (visited.contains(v) ||
-            failedNodes.contains(v) ||
-            failedLinks.contains(edgeKey(u,v))) continue
+      if (current == target) return true
 
-        double e = freshEnergy(v)
-
-        if (v != target && e >= 0d &&
-            e < rxEnergy(DATA_BYTES) + txEnergy(DATA_BYTES) +
-                ROUTING_COST_J + RESERVE_J) {
-          continue
+      (neighbors[current] ?: []).each { int next ->
+        if (!seen.contains(next) &&
+            !visited.contains(next) &&
+            !failedNodes.contains(next) &&
+            !failedLinks.contains(key(current, next)) &&
+            relayEnergyFeasible(next, target)) {
+          seen.add(next)
+          queue.add(next)
         }
-
-        if (v == target) return true
-
-        visited.add(v)
-        queue.add(v)
       }
     }
 
-    return false
+    false
+  }
+
+  private boolean relayEnergyFeasible(int node, int target) {
+    if (failedNodes.contains(node)) return false
+
+    double energy = node == address ? residualEnergy : freshNeighborEnergy(node)
+    if (energy < 0d) return false
+
+    double required = node == target
+      ? rxEnergy() + energyReserve
+      : rxEnergy() + txEnergy() + routingCost + energyReserve
+
+    energy >= required
+  }
+
+  private int shortestDistance(int start, int target) {
+    if (start == target) return 0
+
+    def queue = new ArrayDeque<List<Integer>>()
+    Set<Integer> seen = [] as Set<Integer>
+
+    queue.add([start, 0])
+    seen.add(start)
+
+    while (!queue.isEmpty()) {
+      List<Integer> item = queue.removeFirst()
+      int current = item[0] as int
+      int hops = item[1] as int
+
+      if (current == target) return hops
+
+      (neighbors[current] ?: []).each { int next ->
+        if (!seen.contains(next) &&
+            !failedNodes.contains(next) &&
+            !failedLinks.contains(key(current, next))) {
+          seen.add(next)
+          queue.add([next, hops + 1])
+        }
+      }
+    }
+
+    Integer.MAX_VALUE
+  }
+
+  private double freshNeighborEnergy(int node) {
+    Map snapshot = neighborCache[node]
+
+    if (snapshot == null) {
+      return INITIAL_ENERGY.containsKey(node) ? INITIAL_ENERGY[node] : -1d
+    }
+
+    if (REQUIRE_FRESH_NEIGHBOR_ENERGY &&
+        System.currentTimeMillis() - (snapshot.time as long) > NEIGHBOR_TTL_MS) {
+      return -1d
+    }
+
+    snapshot.energy as double
   }
 
   private double distance(int a, int b) {
-    List<Double> x = position[a]
-    List<Double> y = position[b]
-
-    double sum = 0d
+    double total = 0d
 
     for (int i = 0; i < 3; i++) {
-      sum += Math.pow(x[i]-y[i],2d)
+      double d = position[a][i] - position[b][i]
+      total += d * d
     }
 
-    Math.sqrt(sum)
+    Math.sqrt(total)
   }
 
-  private double reward(int n, int d) {
-    if (n == d) return 100d
-
-    double e = freshEnergy(n)
-    if (e < 0d) return -20d
-
-    double energyBenefit =
-      10d * Math.min(1d,Math.max(0d,e/(INITIAL_ENERGY[n] ?: 100d)))
-
-    double lq = Math.exp(-distance(address,n)/500d) *
-      (observedLQ.containsKey(n) ? observedLQ[n] : 1d)
-
-    double progress =
-      5d * (distance(address,d)-distance(n,d)) /
-      Math.max(1d,distance(address,d))
-
-    double cost =
-      3d * (txEnergy(DATA_BYTES)+rxEnergy(DATA_BYTES)+ROUTING_COST_J)
-
-    energyBenefit + 5d*lq + progress - cost - 1d
+  private static double packetDuration(double bytes = packetBytes) {
+    bytes * 8d / dataRate
   }
 
-  private List<Integer> feasibleActions(int d) {
-    if (!canTransmit()) return []
-
-    (neighbors[address] ?: []).findAll { int n ->
-      feasible(n,d)
-    }
+  private static double txEnergy(double bytes = packetBytes) {
+    txPower * packetDuration(bytes)
   }
 
-  private Integer chooseAction(int d, Collection<Integer> excluded) {
-    List<Integer> actions =
-      feasibleActions(d).findAll { !excluded.contains(it) }
-
-    if (actions.isEmpty()) return null
-
-    if (training && rng.nextDouble() < EPSILON) {
-      return actions[rng.nextInt(actions.size())]
-    }
-
-    Map<Integer,Double> table = q[d] ?: [:]
-
-    double best = actions.collect { int n ->
-      (table[n] ?: 0d) + reward(n,d)
-    }.max() as double
-
-    List<Integer> ties = actions.findAll { int n ->
-      Math.abs((table[n] ?: 0d)+reward(n,d)-best) < 0.000001d
-    }
-
-    ties[rng.nextInt(ties.size())]
+  private static double rxEnergy(double bytes = packetBytes) {
+    rxPower * packetDuration(bytes)
   }
 
-  private double bestQ(int d) {
-    List<Integer> actions = feasibleActions(d)
-    if (actions.isEmpty()) return 0d
-
-    actions.collect { int n ->
-      q[d]?.get(n) ?: 0d
-    }.max() as double
+  private boolean canTransmitLocal() {
+    residualEnergy >= routingCost + txEnergy() + energyReserve
   }
 
-  private void updateQ(int d, int action, double r, double futureQ) {
-    if (!q.containsKey(d)) q[d] = [:]
+  private void debitEnergy(
+    double amount,
+    String reason,
+    boolean advertise = false
+  ) {
+    if (amount <= 0d) return
 
-    double old = q[d][action] ?: 0d
-
-    q[d][action] =
-      old + ALPHA * (r + GAMMA*futureQ - old)
-  }
-
-  private void refreshPolicy(String reason) {
-    if (address < 1) return
-
-    initialiseTables()
-
-    q.keySet().each { int d ->
-      (neighbors[address] ?: []).each { int n ->
-        double old = q[d][n] ?: 0d
-        double target = feasible(n,d) ? reward(n,d) : -20d
-
-        q[d][n] = old + ALPHA*(target-old)
-      }
-    }
-
-    Map<Integer,Integer> updated = [:]
-
-    neighbors.keySet().each { int d ->
-      if (d != address) {
-        Integer nh = chooseAction(d,[])
-        if (nh != null) updated[d] = nh
-      }
-    }
-
-    if (updated != activeRoutes) {
-      stat.routeChanges++
-    }
-
-    activeRoutes = updated
+    residualEnergy = Math.max(0d, residualEnergy - amount)
 
     log.info(
-      "EAFTR QTABLE_RECALCULATED node=${address}, reason=${reason}, " +
-      "nextHops=${activeRoutes}"
+      "EAFTR: node ${address} energy=${String.format('%.3f', residualEnergy)} J after ${reason}"
     )
 
-    syncRouterRoutes()
+    refreshQValues()
+    queueRefresh()
+
+    if (advertise) advertiseEnergyIfChanged()
   }
 
-  private void syncRouterRoutes() {
-    if (router == null || address < 1 || failedNodes.contains(address)) return
-
-    activeRoutes.each { int d, int nh ->
-      if (d == address ||
-          failedNodes.contains(d) ||
-          failedNodes.contains(nh) ||
-          failedLinks.contains(edgeKey(address,nh))) {
-        return
-      }
-
-      try {
-        def req = EditRouteReq.newRoute()
-        req.to = d
-        req.nextHop = nh
-        req.link = link?.name ?: 'uwlink'
-        req.hops = 1
-        req.reliability = true
-        req.metric = (1000d - (q[d]?.get(nh) ?: 0d)) as float
-        req.auto = false
-        req.recipient = router
-
-        send req
-
-        log.info(
-          "EAFTR ROUTE_REQUESTED node=${address}, destination=${d}, nextHop=${nh}"
-        )
-      } catch (Exception ex) {
-        log.warning(
-          "EAFTR ROUTE_SYNC_ERROR destination=${d}: " +
-          "${ex.class.simpleName}: ${ex.message}"
-        )
-      }
+  private void debitDataEnergy(double amount, String reason, boolean advertise = false) {
+    if (!DEBIT_DATA_ENERGY) {
+      log.info("EAFTR: node ${address} would use ${String.format('%.3f', amount)} J for ${reason}; accounting disabled")
+      return
     }
+
+    debitEnergy(amount, reason, advertise)
   }
 
-  private void sendData(int dst) {
-    if (address < 1 || failedNodes.contains(address)) return
-
-    String id = "${address}-${sequence++}"
-    stat.generated++
-
-    forward(
-      id,address,dst,MAX_TTL,[address],
-      System.currentTimeMillis(),0,[]
-    )
-  }
-
-  private void forward(
-    String id,
-    int src,
-    int dst,
-    int ttl,
-    List<Integer> path,
-    long started,
-    int attempt,
-    List<Integer> tried
+  private void recordNeighborAdvertisement(
+    int node,
+    double joules,
+    long sequence,
+    long timestamp
   ) {
-    charge(ROUTING_COST_J,true)
-
-    if (ttl <= 0) {
-      stat.failedFwd++
-      log.warning("EAFTR TTL_EXPIRED id=${id}")
+    if (!(neighbors[address] ?: []).contains(node)) {
+      setDebugStatus("REJECTED ENERGY UPDATE: ${node} is not a neighbour")
+      log.warning("EAFTR: energy update from non-neighbour ${node}")
       return
     }
 
-    Integer nh = chooseAction(dst,path+tried)
-
-    if (nh == null) {
-      stat.noRoute++
-
-      log.warning(
-        "EAFTR NO_FEASIBLE_ROUTE node=${address}, destination=${dst}"
-      )
-
-      sendControl(null,'R')
-
-      if (attempt == 0) {
-        stat.staleEvents++
-
-        add new WakerBehavior(2000, {
-          forward(
-            id,src,dst,ttl,path,started,1,tried
-          )
-        })
-      }
-
+    if (joules < 0d || !Double.isFinite(joules)) {
+      setDebugStatus("REJECTED ENERGY UPDATE: invalid value from ${node}")
+      log.warning("EAFTR: invalid energy value from node ${node}")
       return
     }
 
-    String payload =
-      "D|${id}|${src}|${dst}|${ttl}|${path.join(',')}|${started}"
+    long receivedAt = System.currentTimeMillis()
 
-    boolean sent = transmit(nh,DATA_PROTOCOL,payload,true)
-
-    if (!sent) {
-      stat.failedFwd++
-      updateQ(dst,nh,-20d,0d)
-      refreshPolicy('data transmission failed')
-      return
-    }
-
-    Map ev = [
-      nh:nh,
-      src:src,
-      dst:dst,
-      ttl:ttl,
-      path:path,
-      started:started,
-      tried:tried
+    neighborCache[node] = [
+      energy: joules,
+      sequence: sequence,
+      time: receivedAt,
+      advertisedAt: timestamp
     ]
 
-    pending[id] = ev
+    setDebugStatus(
+      "NEIGHBOUR UPDATED: node=${address}, neighbour=${node}, energy=${joules} J"
+    )
 
-    add new WakerBehavior(ACK_TIMEOUT_MS, {
-      onTimeout(id,ev)
+    log.info(
+      "EAFTR: UPDATED neighbour ${node} energy=${String.format('%.3f', joules)} J"
+    )
+
+    refreshQValues()
+    queueRefresh()
+  }
+
+  private void handleEnergyDatagram(DatagramNtf msg) {
+    String payload
+
+    try {
+      payload = new String(msg.data as byte[], 'UTF-8').trim()
+    } catch (Exception ignored) {
+      setDebugStatus("ERROR: could not decode energy message from ${msg.from}")
+      log.warning('EAFTR: could not decode energy message')
+      return
+    }
+
+    setDebugStatus(
+      "ENERGY PAYLOAD RECEIVED: from=${msg.from}, payload=${payload}"
+    )
+
+    log.info(
+      "EAFTR: energy payload received from ${msg.from}: ${payload}"
+    )
+
+    String[] parts = payload.split(':')
+
+    if (parts.size() == 3 &&
+        parts[0] == 'EAFTR' &&
+        parts[1] == 'ENERGY_REQ') {
+
+      int sender = msg.from as int
+
+      if ((neighbors[address] ?: []).contains(sender)) {
+        long sequence = ++localAdvertisementSequence
+
+        setDebugStatus(
+          "ENERGY REQUEST RECEIVED from ${sender}; replying with ${residualEnergy} J"
+        )
+
+        sendEnergyControl(
+          sender,
+          "EAFTR:ENERGY_RSP:${sequence}:${residualEnergy}:${System.currentTimeMillis()}",
+          msg.sender as AgentID
+        )
+      }
+
+      return
+    }
+
+    if (parts.size() == 5 &&
+        parts[0] == 'EAFTR' &&
+        parts[1] == 'ENERGY_RSP') {
+
+      try {
+        recordNeighborAdvertisement(
+          msg.from as int,
+          parts[3] as double,
+          parts[2] as long,
+          parts[4] as long
+        )
+      } catch (Exception ignored) {
+        setDebugStatus("ERROR: invalid energy response from ${msg.from}")
+        log.warning(
+          "EAFTR: invalid energy response from ${msg.from}"
+        )
+      }
+
+      return
+    }
+
+    setDebugStatus(
+      "UNKNOWN ENERGY MESSAGE from ${msg.from}: ${payload}"
+    )
+
+    log.warning(
+      "EAFTR: unknown energy message from ${msg.from}"
+    )
+  }
+
+  private void sendEnergyControl(
+    int target,
+    String payload,
+    AgentID preferredProvider = null
+  ) {
+    def datagram = preferredProvider ?: agentForService(Services.DATAGRAM)
+
+    if (datagram == null) {
+      setDebugStatus("SEND FAILED: DATAGRAM service unavailable")
+      log.warning('EAFTR: DATAGRAM service unavailable')
+      return
+    }
+
+    byte[] data = payload.getBytes('UTF-8')
+
+    List<Double> costs = pendingControlTxCost[target]
+
+    if (costs == null) {
+      costs = []
+      pendingControlTxCost[target] = costs
+    }
+
+    costs.add(0d)
+
+    setDebugStatus(
+      "SENDING ENERGY CONTROL: node=${address}, to=${target}, payload=${payload}"
+    )
+
+    send new DatagramReq(
+      recipient: datagram,
+      to: target,
+      protocol: energyProtocol,
+      reliability: false,
+      data: data
+    )
+
+    log.info(
+      "EAFTR: sending energy-control datagram to ${target}; battery unchanged"
+    )
+  }
+
+  private void requestNeighborEnergy() {
+    if (link == null || address < 1) return
+
+    long now = System.currentTimeMillis()
+    long requestId = ++localAdvertisementSequence
+
+    (neighbors[address] ?: []).each { int node ->
+      Long previous = lastEnergyRequestAt[node]
+
+      if (!failedNodes.contains(node) &&
+          !failedLinks.contains(key(address, node)) &&
+          (previous == null ||
+           now - previous >= NEIGHBOR_QUERY_MS)) {
+
+        lastEnergyRequestAt[node] = now
+
+        log.info(
+          "EAFTR: requesting energy from node ${node}"
+        )
+
+        sendEnergyControl(
+          node,
+          "EAFTR:ENERGY_REQ:${requestId}"
+        )
+      }
+    }
+  }
+
+  private void advertiseEnergyIfChanged(boolean force = false) {
+    if (link == null || address < 1) {
+      setDebugStatus(
+        "ADVERTISEMENT SKIPPED: link unavailable or address not initialized"
+      )
+      return
+    }
+
+    long now = System.currentTimeMillis()
+
+    boolean enoughTime =
+      now - lastEnergyAdvertisementAt >= MIN_ADVERT_GAP_MS
+
+    boolean enoughChange =
+      Double.isNaN(lastAdvertisedEnergy) ||
+      Math.abs(lastAdvertisedEnergy - residualEnergy) >=
+      ENERGY_CHANGE_THRESHOLD_J
+
+    if (!force && (!enoughTime || !enoughChange)) return
+
+    lastEnergyAdvertisementAt = now
+    lastAdvertisedEnergy = residualEnergy
+
+    long sequence = ++localAdvertisementSequence
+
+    (neighbors[address] ?: []).each { int node ->
+      if (!failedNodes.contains(node) &&
+          !failedLinks.contains(key(address, node))) {
+
+        log.info(
+          "EAFTR: advertising energy=${residualEnergy} J to node ${node}"
+        )
+
+        sendEnergyControl(
+          node,
+          "EAFTR:ENERGY_RSP:${sequence}:${residualEnergy}:${now}"
+        )
+      }
+    }
+  }
+
+  private void scheduleNeighborRequests() {
+    add new WakerBehavior(NEIGHBOR_QUERY_MS, {
+      if (address > 0 && !failedNodes.contains(address)) {
+        requestNeighborEnergy()
+      }
+
+      scheduleNeighborRequests()
     })
   }
 
-  private void onData(int from, String[] p) {
-    if (p.length != 7) return
+  private void scheduleAdvertisements() {
+    add new WakerBehavior(ADVERTISEMENT_INTERVAL_MS, {
+      if (address > 0 && !failedNodes.contains(address)) {
+        advertiseEnergyIfChanged(true)
+      }
 
-    String id = p[1]
-    int src = p[2] as int
-    int dst = p[3] as int
-    int ttl = p[4] as int
-    List<Integer> path = p[5].split(',').collect { it as int }
-    long started = p[6] as long
+      scheduleAdvertisements()
+    })
+  }
 
-    sendControl(from,"A|${id}|${fmt(bestQ(dst))}")
+  private void queueRefresh() {
+    if (address < 1 || refreshQueued) return
 
-    if (!seen.add(id+'@'+address)) {
-      stat.duplicates++
-      return
+    refreshQueued = true
+
+    add new WakerBehavior(250, {
+      refreshQueued = false
+      refreshPolicy()
+    })
+  }
+
+  void refreshPolicy() {
+    if (router == null || address < 1) return
+
+    installedNextHops.keySet().findAll {
+      failedNodes.contains(it) || failedNodes.contains(address)
+    }.toList().each { int target ->
+      removeInstalledRoute(target)
     }
 
-    if (path.contains(address)) {
-      log.warning("EAFTR LOOP_DETECTED id=${id}")
-      return
+    if (failedNodes.contains(address)) return
+
+    neighbors.keySet().findAll {
+      it != address && !failedNodes.contains(it)
+    }.sort().each { int target ->
+      installRoute(target)
     }
+  }
 
-    if (dst == address) {
-      stat.delivered++
-      totalDelayMs += System.currentTimeMillis()-started
+  private void installRoute(int target) {
+    Map<Integer, Double> values = localTable(target)
 
-      log.info(
-        "EAFTR PACKET_DELIVERED id=${id}, path=${path+[address]}"
+    recalculateDestinationQValues(target, values)
+
+    Integer next = bestLocalAction(target, values)
+
+    if (next == null) {
+      removeInstalledRoute(target)
+
+      log.warning(
+        "EAFTR: no feasible route from ${address} to ${target}"
       )
+
       return
     }
 
-    forward(
-      id,src,dst,ttl-1,path+[address],
-      started,0,[]
+    if (installedNextHops[target] == next) return
+
+    if (installedNextHops.containsKey(target)) {
+      removeInstalledRoute(target)
+    }
+
+    def request = EditRouteReq.newRoute()
+
+    request.to = target
+    request.nextHop = next
+    request.link = link
+
+    int routeHops = shortestDistance(address, target)
+    request.hops = routeHops == Integer.MAX_VALUE ? 1 : routeHops
+
+    request.reliability = true
+    request.metric = (1000d + values[next]) as float
+    request.auto = false
+    request.recipient = router
+
+    send(request)
+
+    installedNextHops[target] = next
+
+    log.info(
+      "EAFTR: route ${address} -> ${target} via ${next}"
     )
   }
 
-  private void onAck(int from, String[] p) {
-    Map ev = pending.remove(p[1])
-    if (ev == null) return
+  private void removeInstalledRoute(int target) {
+    Integer oldNext = installedNextHops.remove(target)
 
-    int nh = ev.nh as int
-    int d = ev.dst as int
+    if (oldNext == null) return
 
-    updateQ(d,nh,reward(nh,d),p[2] as double)
+    def request = EditRouteReq.deleteRoute()
 
-    double old = observedLQ.containsKey(nh) ? observedLQ[nh] : 1d
-    observedLQ[nh] = 0.7d*old + 0.3d
+    request.to = target
+    request.nextHop = oldNext
+    request.link = link
+    request.recipient = router
 
-    suspectUntil.remove(nh)
-    refreshPolicy("ACK from ${from}")
+    send(request)
   }
 
-  private void onTimeout(String id, Map ev) {
-    if (!pending.containsKey(id) || !pending[id].is(ev)) return
-
-    pending.remove(id)
-
-    int nh = ev.nh as int
-    int d = ev.dst as int
-
-    updateQ(d,nh,-20d,0d)
-
-    double old = observedLQ.containsKey(nh) ? observedLQ[nh] : 1d
-    observedLQ[nh] = 0.7d*old
-
-    suspectUntil[nh] = System.currentTimeMillis()+SUSPECT_MS
-    stat.failedFwd++
-
-    refreshPolicy("ACK timeout at ${nh}")
-
-    List<Integer> tried = (ev.tried as List<Integer>)+[nh]
-
-    if (tried.size() <= MAX_RETRIES) {
-      forward(
-        id,
-        ev.src as int,
-        ev.dst as int,
-        ev.ttl as int,
-        ev.path as List<Integer>,
-        ev.started as long,
-        1,
-        tried
-      )
-    } else {
-      log.warning("EAFTR PACKET_LOST id=${id}")
-    }
-  }
-
-  private static String fmt(double value) {
-    String.format('%.3f',value)
-  }
-
-  private static String edgeKey(int a, int b) {
-    "${Math.min(a,b)}-${Math.max(a,b)}"
+  private static String key(int a, int b) {
+    "${Math.min(a, b)}-${Math.max(a, b)}"
   }
 }
