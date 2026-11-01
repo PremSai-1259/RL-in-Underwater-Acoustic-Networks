@@ -10,7 +10,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
   enum Params implements Parameter {
     destination, energy, failedLinks, failedNodes, episodes,
-    neighborInfo, qtable, routes, traceRoute, debug
+    neighborInfo, qtable, qtable_allstates, routes, traceRoute, debug
   }
 
   static final String title = 'EAFTR Q-learning routing'
@@ -25,7 +25,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
   static final double energyReserve = 0.10d
 
   static final Map<Integer, Double> INITIAL_ENERGY = [
-    1: 100d, 2: 80d, 3: 85d, 4: 0d,
+    1: 100d, 2: 80d, 3: 85d, 4: 100d,
     5: 65d, 6: 70d, 7: 90d, 8: 100d
   ]
 
@@ -76,6 +76,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
   // regardless of assignment order or input formatting.
   private Map<String, Map<Integer, Map<Integer, Double>>> qTablesByState = [:]
   private Map<String, Map<Integer, Set<Integer>>> bootstrappedByState = [:]
+  private Map<String, Map<Integer, Double>> lastQEnergyProfileByState = [:]
   private Map<Integer, Map> neighborCache = [:]
 
   private Map<Integer, Integer> installedNextHops = [:]
@@ -101,6 +102,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
   static final long ADVERTISEMENT_INTERVAL_MS = 5000L
   static final long MIN_ADVERT_GAP_MS = 2000L
   static final double ENERGY_CHANGE_THRESHOLD_J = 1.0d
+  static final double Q_ENERGY_RECALCULATION_DELTA_J = 1.0d
 
   @Override
   List<Parameter> getParameterList() {
@@ -108,7 +110,8 @@ class EnergyAwareRoutingAgent extends UnetAgent {
   }
 
   boolean isReadOnly(Parameter p) {
-    p == Params.qtable || p == Params.neighborInfo || p == Params.debug
+    p == Params.qtable || p == Params.qtable_allstates ||
+      p == Params.neighborInfo || p == Params.debug
   }
 
   private void setDebugStatus(String message) {
@@ -140,8 +143,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
     log.info("EAFTR: node ${address} energy set to ${residualEnergy} J")
 
-    refreshQValues()
-    queueRefresh()
+    if (refreshQValues()) queueRefresh()
 
     lastAdvertisedEnergy = Double.NaN
     lastEnergyAdvertisementAt = 0L
@@ -168,6 +170,34 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     Map<Integer, Map<Integer, Double>> qTables = currentQTables()
     StringBuilder out = new StringBuilder()
     out.append("EAFTR Q-table at node ${address}; state=${networkStateKey()}\n")
+    appendQTable(out, qTables)
+    out.toString()
+  }
+
+  // Shell usage: rlroute.qtable_allstates
+  String getQtable_allstates() {
+    if (address < 1) return 'Agent is still starting.'
+
+    StringBuilder out = new StringBuilder()
+    out.append("EAFTR stored Q-tables at node ${address}; states=${qTablesByState.size()}\n")
+
+    if (qTablesByState.isEmpty()) {
+      out.append('No Q-table states have been created yet.\n')
+      return out.toString()
+    }
+
+    qTablesByState.keySet().sort().each { String state ->
+      out.append("\n===== ${state} =====\n")
+      appendQTable(out, qTablesByState[state])
+    }
+
+    out.toString()
+  }
+
+  private void appendQTable(
+    StringBuilder out,
+    Map<Integer, Map<Integer, Double>> qTables
+  ) {
     out.append('Q[destination][nextHop]\n')
 
     qTables.keySet().sort().each { int target ->
@@ -180,8 +210,6 @@ class EnergyAwareRoutingAgent extends UnetAgent {
         )
       }
     }
-
-    out.toString()
   }
 
   String getRoutes() {
@@ -208,7 +236,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     if (target == address) return "Already at destination ${target}."
 
     Map<Integer, Double> values = localTable(target)
-    recalculateDestinationQValues(target, values)
+    refreshQValues()
 
     Integer next = bestLocalAction(target, values)
 
@@ -233,7 +261,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
       if (current == address) {
         Map<Integer, Double> values = localTable(target)
-        recalculateDestinationQValues(target, values)
+        refreshQValues()
         next = bestLocalAction(target, values, visited)
       } else {
         List<Integer> options = (neighbors[current] ?: []).findAll { int n ->
@@ -306,7 +334,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
       }
 
       initializeTables()
-      refreshQValues()
+      refreshQValues(true)
       refreshPolicy()
 
       log.info(
@@ -432,7 +460,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
     log.info("EAFTR: manually configured failed links = ${failedLinks}")
 
-    refreshQValues()
+    refreshQValues(true)
     queueRefresh()
   }
 
@@ -450,7 +478,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
     log.info("EAFTR: manually configured failed nodes = ${failedNodes}")
 
-    refreshQValues()
+    refreshQValues(true)
     queueRefresh()
   }
 
@@ -469,7 +497,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     }
 
     episodes = value
-    refreshQValues()
+    refreshQValues(true)
     queueRefresh()
   }
 
@@ -492,14 +520,55 @@ class EnergyAwareRoutingAgent extends UnetAgent {
     qTables[target]
   }
 
-  private void refreshQValues() {
-    if (address < 1) return
+  private boolean refreshQValues(boolean force = false) {
+    if (address < 1) return false
 
     initializeTables()
+
+    String state = networkStateKey()
+    Map<Integer, Double> profile = currentQEnergyProfile()
+    if (!force && !energyProfileRequiresRefresh(state, profile)) return false
 
     Map<Integer, Map<Integer, Double>> qTables = currentQTables()
     qTables.keySet().each { int target ->
       recalculateDestinationQValues(target, qTables[target])
+    }
+
+    lastQEnergyProfileByState[state] = profile
+    true
+  }
+
+  private Map<Integer, Double> currentQEnergyProfile() {
+    Map<Integer, Double> profile = [(address): residualEnergy]
+    (neighbors[address] ?: []).each { int node ->
+      double energy = freshNeighborEnergy(node)
+      if (energy >= 0d) profile[node] = energy
+    }
+    profile
+  }
+
+  private boolean energyProfileRequiresRefresh(
+    String state,
+    Map<Integer, Double> current
+  ) {
+    Map<Integer, Double> previous = lastQEnergyProfileByState[state]
+    if (previous == null) return true
+
+    Set<Integer> nodes = [] as Set<Integer>
+    nodes.addAll(previous.keySet())
+    nodes.addAll(current.keySet())
+
+    nodes.any { int node ->
+      Double before = previous[node]
+      Double after = current[node]
+      if (before == null || after == null) return true
+
+      double required = node == address
+        ? routingCost + txEnergy() + energyReserve
+        : rxEnergy() + txEnergy() + routingCost + energyReserve
+
+      Math.abs(after - before) >= Q_ENERGY_RECALCULATION_DELTA_J ||
+        ((before >= required) != (after >= required))
     }
   }
 
@@ -777,8 +846,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
       "EAFTR: node ${address} energy=${String.format('%.3f', residualEnergy)} J after ${reason}"
     )
 
-    refreshQValues()
-    queueRefresh()
+    if (refreshQValues()) queueRefresh()
 
     if (advertise) advertiseEnergyIfChanged()
   }
@@ -827,8 +895,7 @@ class EnergyAwareRoutingAgent extends UnetAgent {
       "EAFTR: UPDATED neighbour ${node} energy=${String.format('%.3f', joules)} J"
     )
 
-    refreshQValues()
-    queueRefresh()
+    if (refreshQValues()) queueRefresh()
   }
 
   private void handleEnergyDatagram(DatagramNtf msg) {
@@ -1066,8 +1133,6 @@ class EnergyAwareRoutingAgent extends UnetAgent {
 
   private void installRoute(int target) {
     Map<Integer, Double> values = localTable(target)
-
-    recalculateDestinationQValues(target, values)
 
     Integer next = bestLocalAction(target, values)
 
